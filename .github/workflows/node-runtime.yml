@@ -1,0 +1,119 @@
+name: node-runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      dist_tag:
+        description: "Node.js dist directory (e.g. latest-v24.x or v24.8.0)"
+        required: true
+        default: "latest-v24.x"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    env:
+      NODE_DIST_TAG: ${{ inputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download Node.js runtimes
+        run: |
+          set -euo pipefail
+          BASE_URL="https://nodejs.org/dist/${NODE_DIST_TAG}"
+          mkdir -p out/node
+
+          curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt
+
+          RAW_VERSION=$(grep -oE 'node-v[0-9]+\.[0-9]+\.[0-9]+' out/node/SHASUMS256.txt | head -1)
+          NODE_VERSION="${RAW_VERSION#node-}"
+          if [ -z "${NODE_VERSION}" ]; then
+            echo "Failed to detect Node.js version from SHASUMS256.txt"
+            exit 1
+          fi
+          echo "NODE_VERSION=${NODE_VERSION}" >> "$GITHUB_ENV"
+
+          download() {
+            local platform="$1"
+            local filename="$2"
+            local url="${BASE_URL}/${filename}"
+            local dest="out/node/${platform}/${filename}"
+            local expected
+            local actual
+
+            mkdir -p "out/node/${platform}"
+            curl -fsS "${url}" -o "${dest}"
+
+            expected=$(grep " ${filename}\$" out/node/SHASUMS256.txt | awk '{print $1}')
+            if [ -z "${expected}" ]; then
+              echo "Missing checksum for ${filename}"
+              exit 1
+            fi
+            actual=$(sha256sum "${dest}" | awk '{print $1}')
+            if [ "${expected}" != "${actual}" ]; then
+              echo "Checksum mismatch for ${filename}"
+              echo "Expected: ${expected}"
+              echo "Actual:   ${actual}"
+              exit 1
+            fi
+          }
+
+          download linux-x64 "node-v${NODE_VERSION}-linux-x64.tar.xz"
+          download linux-arm64 "node-v${NODE_VERSION}-linux-arm64.tar.xz"
+          download darwin-x64 "node-v${NODE_VERSION}-darwin-x64.tar.gz"
+          download darwin-arm64 "node-v${NODE_VERSION}-darwin-arm64.tar.gz"
+          download win32-x64 "node-v${NODE_VERSION}-win-x64.zip"
+          download win32-arm64 "node-v${NODE_VERSION}-win-arm64.zip"
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+
+          const root = path.join('out', 'node');
+          const version = process.env.NODE_VERSION || '';
+          const result = {
+            version,
+            generated_at: new Date().toISOString(),
+            platforms: {}
+          };
+
+          for (const platform of fs.readdirSync(root)) {
+            const dir = path.join(root, platform);
+            if (!fs.statSync(dir).isDirectory()) {
+              continue;
+            }
+            const files = {};
+            for (const file of fs.readdirSync(dir)) {
+              const filePath = path.join(dir, file);
+              if (!fs.statSync(filePath).isFile()) {
+                continue;
+              }
+              const data = fs.readFileSync(filePath);
+              const hash = crypto.createHash('sha256').update(data).digest('hex');
+              files[file] = {
+                sha256: hash,
+                size: fs.statSync(filePath).size
+              };
+            }
+            result.platforms[platform] = { files };
+          }
+
+          fs.writeFileSync(
+            path.join('out', 'node', 'checksums.json'),
+            JSON.stringify(result, null, 2)
+          );
+          NODE
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ env.NODE_VERSION }}-runtime
+          path: out/node
+          if-no-files-found: error

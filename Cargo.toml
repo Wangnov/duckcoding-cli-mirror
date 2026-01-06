@@ -1,0 +1,51 @@
+[package]
+name = "duckcoding-cli-mirror"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A mirror service for CLI tools (Claude Code, Codex, Gemini CLI)"
+license = "MIT"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# Web 框架
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# HTTP 客户端
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# SHA256 校验
+sha2 = "0.10"
+hex = "0.4"
+
+# 日志追踪
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 异步流处理
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# 命令行参数
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+hyper = { version = "1.0", features = ["full"] }
+http-body-util = "0.1"

@@ -1,0 +1,55 @@
+# Server configuration
+[server]
+port = 1357
+host = "0.0.0.0"
+# Public URL for install scripts (used in curl commands)
+# NOTE: public_url 必须配置，否则脚本接口将返回 503
+# Examples:
+#   public_url = "http://yourip:1357"      # Direct IP
+#   public_url = "https://mirror.example.com"       # Domain with HTTPS
+# If not set, install scripts will return 503
+# public_url = "http://yourip:1357"
+
+# Cache settings
+[cache]
+dir = "./cache"
+max_versions = 10
+
+# Auto-update settings
+[update]
+interval_minutes = 10
+enabled = true
+
+# Claude Code mirror configuration
+[claude_code]
+enabled = true
+tags = ["stable", "latest"]
+platforms = [
+    "darwin-x64",
+    "darwin-arm64",
+    "linux-x64",
+    "linux-arm64",
+    "linux-x64-musl",
+    "linux-arm64-musl",
+    "win32-x64"
+]
+# Upstream URL (default: official GCS bucket)
+# upstream_url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
+
+# Codex mirror configuration
+[codex]
+enabled = true
+tags = ["stable", "latest"]
+# If true, "latest" will include prereleases. "stable" always excludes prereleases.
+include_prerelease = false
+repo = "openai/codex"
+platforms = [
+    "darwin-x64",
+    "darwin-arm64",
+    "linux-x64",
+    "linux-arm64",
+    "linux-x64-musl",
+    "linux-arm64-musl",
+    "win32-x64",
+    "win32-arm64"
+]
