@@ -19,6 +19,15 @@ pub struct Config {
 
     #[serde(default)]
     pub codex: CodexConfig,
+
+    #[serde(default)]
+    pub gemini: GeminiConfig,
+
+    #[serde(default)]
+    pub node: NodeConfig,
+
+    #[serde(default)]
+    pub node_pty: NodePtyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +242,144 @@ fn default_codex_include_prerelease() -> bool {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiConfig {
+    #[serde(default = "default_gemini_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_gemini_tags")]
+    pub tags: Vec<String>,
+
+    #[serde(default = "default_gemini_repo")]
+    pub repo: String,
+
+    #[serde(default = "default_gemini_include_prerelease")]
+    pub include_prerelease: bool,
+}
+
+impl Default for GeminiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gemini_enabled(),
+            tags: default_gemini_tags(),
+            repo: default_gemini_repo(),
+            include_prerelease: default_gemini_include_prerelease(),
+        }
+    }
+}
+
+fn default_gemini_enabled() -> bool {
+    std::env::var("MIRROR_GEMINI_ENABLED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true)
+}
+
+fn default_gemini_tags() -> Vec<String> {
+    default_tags()
+}
+
+fn default_gemini_repo() -> String {
+    std::env::var("MIRROR_GEMINI_REPO").unwrap_or_else(|_| "google-gemini/gemini-cli".to_string())
+}
+
+fn default_gemini_include_prerelease() -> bool {
+    std::env::var("MIRROR_GEMINI_INCLUDE_PRERELEASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    #[serde(default = "default_node_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_node_tags")]
+    pub tags: Vec<String>,
+
+    #[serde(default = "default_node_platforms")]
+    pub platforms: Vec<String>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_node_enabled(),
+            tags: default_node_tags(),
+            platforms: default_node_platforms(),
+        }
+    }
+}
+
+fn default_node_enabled() -> bool {
+    std::env::var("MIRROR_NODE_ENABLED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true)
+}
+
+fn default_node_tags() -> Vec<String> {
+    vec!["latest".to_string()]
+}
+
+fn default_node_platforms() -> Vec<String> {
+    vec![
+        "darwin-x64".to_string(),
+        "darwin-arm64".to_string(),
+        "linux-x64".to_string(),
+        "linux-arm64".to_string(),
+        "win32-x64".to_string(),
+        "win32-arm64".to_string(),
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodePtyConfig {
+    #[serde(default = "default_node_pty_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_node_pty_tags")]
+    pub tags: Vec<String>,
+
+    #[serde(default = "default_node_pty_platforms")]
+    pub platforms: Vec<String>,
+}
+
+impl Default for NodePtyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_node_pty_enabled(),
+            tags: default_node_pty_tags(),
+            platforms: default_node_pty_platforms(),
+        }
+    }
+}
+
+fn default_node_pty_enabled() -> bool {
+    std::env::var("MIRROR_NODE_PTY_ENABLED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true)
+}
+
+fn default_node_pty_tags() -> Vec<String> {
+    vec!["latest".to_string()]
+}
+
+fn default_node_pty_platforms() -> Vec<String> {
+    vec![
+        "darwin-x64".to_string(),
+        "darwin-arm64".to_string(),
+        "linux-x64".to_string(),
+        "linux-arm64".to_string(),
+        "linux-x64-musl".to_string(),
+        "linux-arm64-musl".to_string(),
+        "win32-x64".to_string(),
+        "win32-arm64".to_string(),
+    ]
 }
 
 impl Config {

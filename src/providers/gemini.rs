@@ -12,11 +12,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
-use crate::config::CodexConfig;
+use crate::config::GeminiConfig;
 use crate::error::MirrorError;
 
-const PROVIDER_NAME: &str = "codex";
+const PROVIDER_NAME: &str = "gemini";
 const GITHUB_API_BASE: &str = "https://api.github.com";
+const GEMINI_ASSET_NAME: &str = "gemini.js";
+const GEMINI_PLATFORM: &str = "universal";
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -39,15 +41,15 @@ struct DownloadResult {
     sha256: String,
 }
 
-pub struct CodexProvider {
-    config: CodexConfig,
+pub struct GeminiProvider {
+    config: GeminiConfig,
     client: Client,
     cache: Arc<CacheManager>,
     github_token: Option<String>,
 }
 
-impl CodexProvider {
-    pub fn new(config: CodexConfig, cache: Arc<CacheManager>) -> Self {
+impl GeminiProvider {
+    pub fn new(config: GeminiConfig, cache: Arc<CacheManager>) -> Self {
         let client = Client::builder()
             .user_agent("duckcoding-cli-mirror/0.1.0")
             .connect_timeout(Duration::from_secs(10))
@@ -88,8 +90,7 @@ impl CodexProvider {
             return Err(MirrorError::VersionNotFound("releases".to_string()).into());
         }
 
-        let releases = response.json::<Vec<Release>>().await?;
-        Ok(releases)
+        Ok(response.json::<Vec<Release>>().await?)
     }
 
     async fn fetch_release_by_tag(&self, tag: &str) -> Result<Release> {
@@ -115,29 +116,6 @@ impl CodexProvider {
         releases
             .iter()
             .find(|release| !release.draft && (allow_prerelease || !release.prerelease))
-    }
-
-    fn platform_target(platform: &str) -> Option<&'static str> {
-        match platform {
-            "darwin-x64" => Some("x86_64-apple-darwin"),
-            "darwin-arm64" => Some("aarch64-apple-darwin"),
-            "linux-x64" => Some("x86_64-unknown-linux-gnu"),
-            "linux-arm64" => Some("aarch64-unknown-linux-gnu"),
-            "linux-x64-musl" => Some("x86_64-unknown-linux-musl"),
-            "linux-arm64-musl" => Some("aarch64-unknown-linux-musl"),
-            "win32-x64" => Some("x86_64-pc-windows-msvc"),
-            "win32-arm64" => Some("aarch64-pc-windows-msvc"),
-            _ => None,
-        }
-    }
-
-    fn asset_name_for_platform(platform: &str) -> Option<String> {
-        let target = Self::platform_target(platform)?;
-        if platform.starts_with("win32") {
-            Some(format!("codex-{}.exe", target))
-        } else {
-            Some(format!("codex-{}.tar.gz", target))
-        }
     }
 
     fn asset_digest_sha256(asset: &Asset) -> Option<&str> {
@@ -266,121 +244,103 @@ impl CodexProvider {
 
         let release = self.fetch_release_by_tag(version).await?;
         let metadata = self.cache.get_metadata().await;
-        let existing_version = metadata.codex.versions.get(version);
+        let existing_version = metadata.gemini.versions.get(version);
+
+        let asset = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == GEMINI_ASSET_NAME)
+            .ok_or_else(|| {
+                MirrorError::Provider(format!(
+                    "Asset {} not found for {}",
+                    GEMINI_ASSET_NAME, version
+                ))
+            })?;
+
+        let path = self
+            .cache
+            .binary_path(PROVIDER_NAME, version, GEMINI_PLATFORM, &asset.name);
 
         let mut platforms_metadata = HashMap::new();
-        let mut failures = Vec::new();
 
-        for platform in &self.config.platforms {
-            let asset_name = match Self::asset_name_for_platform(platform) {
-                Some(name) => name,
-                None => {
-                    failures.push(format!("Unsupported platform {}", platform));
-                    continue;
-                }
-            };
+        if path.exists() {
+            let expected = existing_version
+                .and_then(|version_meta| version_meta.platforms.get(GEMINI_PLATFORM))
+                .map(|meta| meta.sha256.clone())
+                .or_else(|| Self::asset_digest_sha256(asset).map(str::to_string));
 
-            let asset = match release.assets.iter().find(|a| a.name == asset_name) {
-                Some(asset) => asset,
-                None => {
-                    failures.push(format!("Asset not found for {}", platform));
-                    continue;
-                }
-            };
-
-            let path = self
-                .cache
-                .binary_path(PROVIDER_NAME, version, platform, &asset.name);
-
-            if path.exists() {
-                let expected = existing_version
-                    .and_then(|version_meta| version_meta.platforms.get(platform))
-                    .map(|meta| meta.sha256.clone())
-                    .or_else(|| Self::asset_digest_sha256(asset).map(str::to_string));
-
-                if let Some(expected) = expected {
-                    match Self::verify_file_checksum(&path, &expected).await {
-                        Ok(size) => {
-                            platforms_metadata.insert(
-                                platform.clone(),
-                                PlatformMetadata {
-                                    sha256: expected,
-                                    size,
-                                    filename: asset.name.clone(),
-                                    files: HashMap::new(),
-                                },
-                            );
-                            info!(
-                                "Asset verified: {}/{}/{} ({} bytes)",
-                                version, platform, asset.name, size
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Existing asset checksum failed for {}/{}: {}",
-                                version, platform, e
-                            );
-                            let _ = tokio::fs::remove_file(&path).await;
-                        }
+            if let Some(expected) = expected {
+                match Self::verify_file_checksum(&path, &expected).await {
+                    Ok(size) => {
+                        platforms_metadata.insert(
+                            GEMINI_PLATFORM.to_string(),
+                            PlatformMetadata {
+                                sha256: expected,
+                                size,
+                                filename: asset.name.clone(),
+                                files: HashMap::new(),
+                            },
+                        );
+                        info!(
+                            "Asset verified: {}/{}/{} ({} bytes)",
+                            version, GEMINI_PLATFORM, asset.name, size
+                        );
+                        self.cache
+                            .update_provider_metadata(PROVIDER_NAME, |m| {
+                                m.versions.insert(
+                                    version.to_string(),
+                                    VersionMetadata {
+                                        version: version.to_string(),
+                                        downloaded_at: Utc::now(),
+                                        platforms: platforms_metadata.clone(),
+                                    },
+                                );
+                            })
+                            .await?;
+                        return Ok(());
                     }
-                } else {
-                    let _ = tokio::fs::remove_file(&path).await;
-                }
-            }
-
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-
-            match self
-                .download_asset_to_path(&asset.browser_download_url, &path)
-                .await
-            {
-                Ok(result) => {
-                    if let Some(expected) = Self::asset_digest_sha256(asset) {
-                        if result.sha256 != expected {
-                            warn!(
-                                "Checksum verification failed for {}/{}: expected {}, got {}",
-                                version, platform, expected, result.sha256
-                            );
-                            let _ = tokio::fs::remove_file(&path).await;
-                            failures.push(format!("Checksum mismatch for {}", platform));
-                            continue;
-                        }
+                    Err(e) => {
+                        warn!("Existing asset checksum failed for {}: {}", version, e);
+                        let _ = tokio::fs::remove_file(&path).await;
                     }
-
-                    platforms_metadata.insert(
-                        platform.clone(),
-                        PlatformMetadata {
-                            sha256: result.sha256,
-                            size: result.size,
-                            filename: asset.name.clone(),
-                            files: HashMap::new(),
-                        },
-                    );
-
-                    info!(
-                        "Saved asset: {}/{}/{} ({} bytes)",
-                        version, platform, asset.name, result.size
-                    );
                 }
-                Err(e) => {
-                    warn!("Failed to download {}/{}: {}", version, platform, e);
-                    let _ = tokio::fs::remove_file(&path).await;
-                    failures.push(format!("Download failed for {}", platform));
-                }
+            } else {
+                let _ = tokio::fs::remove_file(&path).await;
             }
         }
 
-        if !failures.is_empty() {
-            return Err(MirrorError::Provider(format!(
-                "Sync incomplete for {}: {}",
-                version,
-                failures.join(", ")
-            ))
-            .into());
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
+
+        let result = self
+            .download_asset_to_path(&asset.browser_download_url, &path)
+            .await?;
+
+        if let Some(expected) = Self::asset_digest_sha256(asset) {
+            if result.sha256 != expected {
+                warn!(
+                    "Checksum verification failed for {}: expected {}, got {}",
+                    version, expected, result.sha256
+                );
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(MirrorError::ChecksumMismatch {
+                    expected: expected.to_string(),
+                    actual: result.sha256,
+                }
+                .into());
+            }
+        }
+
+        platforms_metadata.insert(
+            GEMINI_PLATFORM.to_string(),
+            PlatformMetadata {
+                sha256: result.sha256,
+                size: result.size,
+                filename: asset.name.clone(),
+                files: HashMap::new(),
+            },
+        );
 
         self.cache
             .update_provider_metadata(PROVIDER_NAME, |m| {
@@ -400,26 +360,23 @@ impl CodexProvider {
 
     async fn is_version_complete(&self, version: &str) -> bool {
         let metadata = self.cache.get_metadata().await;
-        let provider = &metadata.codex;
+        let provider = &metadata.gemini;
         let Some(version_meta) = provider.versions.get(version) else {
             return false;
         };
 
-        for platform in &self.config.platforms {
-            let Some(platform_meta) = version_meta.platforms.get(platform) else {
-                return false;
-            };
+        let Some(platform_meta) = version_meta.platforms.get(GEMINI_PLATFORM) else {
+            return false;
+        };
 
-            if !self
-                .cache
-                .binary_exists(PROVIDER_NAME, version, platform, &platform_meta.filename)
-                .await
-            {
-                return false;
-            }
-        }
-
-        true
+        self.cache
+            .binary_exists(
+                PROVIDER_NAME,
+                version,
+                GEMINI_PLATFORM,
+                &platform_meta.filename,
+            )
+            .await
     }
 
     pub async fn sync_all(&self) -> Result<Vec<String>> {
@@ -442,7 +399,7 @@ impl CodexProvider {
 
     pub async fn get_info(&self) -> serde_json::Value {
         let metadata = self.cache.get_metadata().await;
-        let provider = &metadata.codex;
+        let provider = &metadata.gemini;
 
         let display_version = provider
             .tags
@@ -458,7 +415,7 @@ impl CodexProvider {
                         platform.clone(),
                         serde_json::json!({
                             "version": version,
-                            "url": format!("/codex/{}/{}/{}", version, platform, meta.filename),
+                            "url": format!("/gemini/{}/{}", version, meta.filename),
                             "sha256": meta.sha256,
                             "size": meta.size
                         }),

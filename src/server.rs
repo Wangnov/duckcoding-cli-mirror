@@ -15,9 +15,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
-use crate::cache::CacheManager;
+use crate::cache::{CacheManager, ProviderMetadata};
 use crate::config::Config;
-use crate::providers::{ClaudeCodeProvider, CodexProvider};
+use crate::providers::{
+    ClaudeCodeProvider, CodexProvider, GeminiProvider, NodeProvider, NodePtyProvider,
+};
 
 /// Shared application state
 pub struct AppState {
@@ -25,6 +27,9 @@ pub struct AppState {
     pub cache: Arc<CacheManager>,
     pub claude_code: ClaudeCodeProvider,
     pub codex: CodexProvider,
+    pub gemini: GeminiProvider,
+    pub node: NodeProvider,
+    pub node_pty: NodePtyProvider,
     pub sync_lock: Mutex<()>,
 }
 
@@ -34,12 +39,18 @@ pub async fn run(config: Config, cache: CacheManager) -> Result<()> {
     // Create providers
     let claude_code = ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone());
     let codex = CodexProvider::new(config.codex.clone(), cache.clone());
+    let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone());
+    let node = NodeProvider::new(config.node.clone(), cache.clone());
+    let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone());
 
     let state = Arc::new(AppState {
         config: config.clone(),
         cache: cache.clone(),
         claude_code,
         codex,
+        gemini,
+        node,
+        node_pty,
         sync_lock: Mutex::new(()),
     });
 
@@ -109,6 +120,24 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/codex/install.ps1", get(codex_install_ps1))
         .route("/codex/uninstall.sh", get(codex_uninstall_sh))
         .route("/codex/uninstall.ps1", get(codex_uninstall_ps1))
+        // Gemini routes
+        .route("/gemini/{tag}", get(gemini_tag))
+        .route("/gemini/{version}/gemini.js", get(gemini_binary))
+        // Node runtime routes
+        .route("/node/{tag}", get(node_tag))
+        .route("/node/{version}/{platform}/{filename}", get(node_binary))
+        .route("/node/{version}/checksums.json", get(node_checksums))
+        .route("/node/{version}/SHASUMS256.txt", get(node_shasums))
+        // node-pty routes
+        .route("/node-pty/{tag}", get(node_pty_tag))
+        .route(
+            "/node-pty/{version}/prebuilds/{platform}/{filename}",
+            get(node_pty_binary),
+        )
+        .route(
+            "/node-pty/{version}/checksums.json",
+            get(node_pty_checksums),
+        )
         // API routes
         .route("/api/claude-code/info", get(api_claude_code_info))
         .route("/api/claude-code/versions", get(api_claude_code_versions))
@@ -118,6 +147,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/codex/versions", get(api_codex_versions))
         .route("/api/codex/checksums", get(api_codex_checksums))
         .route("/api/codex/refresh", post(api_codex_refresh))
+        .route("/api/gemini/info", get(api_gemini_info))
+        .route("/api/gemini/versions", get(api_gemini_versions))
+        .route("/api/gemini/checksums", get(api_gemini_checksums))
+        .route("/api/gemini/refresh", post(api_gemini_refresh))
+        .route("/api/node/info", get(api_node_info))
+        .route("/api/node/versions", get(api_node_versions))
+        .route("/api/node/checksums", get(api_node_checksums))
+        .route("/api/node/refresh", post(api_node_refresh))
+        .route("/api/node-pty/info", get(api_node_pty_info))
+        .route("/api/node-pty/versions", get(api_node_pty_versions))
+        .route("/api/node-pty/checksums", get(api_node_pty_checksums))
+        .route("/api/node-pty/refresh", post(api_node_pty_refresh))
         // Add middleware
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any))
@@ -158,6 +199,54 @@ async fn codex_tag(
 
     state
         .codex
+        .get_tag_version(&tag)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// Get Gemini tag version
+async fn gemini_tag(
+    State(state): State<Arc<AppState>>,
+    Path(tag): Path<String>,
+) -> Result<String, StatusCode> {
+    if tag != "stable" && tag != "latest" {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    state
+        .gemini
+        .get_tag_version(&tag)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// Get Node.js tag version
+async fn node_tag(
+    State(state): State<Arc<AppState>>,
+    Path(tag): Path<String>,
+) -> Result<String, StatusCode> {
+    if tag != "stable" && tag != "latest" {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    state
+        .node
+        .get_tag_version(&tag)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// Get node-pty tag version
+async fn node_pty_tag(
+    State(state): State<Arc<AppState>>,
+    Path(tag): Path<String>,
+) -> Result<String, StatusCode> {
+    if tag != "stable" && tag != "latest" {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    state
+        .node_pty
         .get_tag_version(&tag)
         .await
         .ok_or(StatusCode::NOT_FOUND)
@@ -277,6 +366,200 @@ async fn codex_binary(
             format!("attachment; filename=\"{}\"", filename),
         )
         .body(body)
+        .unwrap())
+}
+
+// Download Gemini CLI JS
+async fn gemini_binary(
+    State(state): State<Arc<AppState>>,
+    Path(version): Path<String>,
+) -> Result<Response, StatusCode> {
+    let path = state
+        .cache
+        .get_file_path("gemini", &["versions", &version, "universal", "gemini.js"])
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"gemini.js\"",
+        )
+        .body(body)
+        .unwrap())
+}
+
+// Download Node.js runtime
+async fn node_binary(
+    State(state): State<Arc<AppState>>,
+    Path((version, platform, filename)): Path<(String, String, String)>,
+) -> Result<Response, StatusCode> {
+    let metadata = state.cache.get_metadata().await;
+    let provider = &metadata.node;
+    let version_meta = provider
+        .versions
+        .get(&version)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let platform_meta = version_meta
+        .platforms
+        .get(&platform)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if platform_meta.filename != filename {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let path = state
+        .cache
+        .get_file_path("node", &["versions", &version, &platform, &filename])
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(body)
+        .unwrap())
+}
+
+async fn node_checksums(
+    State(state): State<Arc<AppState>>,
+    Path(version): Path<String>,
+) -> Result<Response, StatusCode> {
+    let path = state
+        .cache
+        .get_file_path("node", &["versions", &version, "checksums.json"])
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(content))
+        .unwrap())
+}
+
+async fn node_shasums(
+    State(state): State<Arc<AppState>>,
+    Path(version): Path<String>,
+) -> Result<Response, StatusCode> {
+    let path = state
+        .cache
+        .get_file_path("node", &["versions", &version, "SHASUMS256.txt"])
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(content))
+        .unwrap())
+}
+
+// Download node-pty prebuild file
+async fn node_pty_binary(
+    State(state): State<Arc<AppState>>,
+    Path((version, platform, filename)): Path<(String, String, String)>,
+) -> Result<Response, StatusCode> {
+    let metadata = state.cache.get_metadata().await;
+    let provider = &metadata.node_pty;
+    let version_meta = provider
+        .versions
+        .get(&version)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let platform_meta = version_meta
+        .platforms
+        .get(&platform)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let allowed = if platform_meta.files.is_empty() {
+        platform_meta.filename == filename
+    } else {
+        platform_meta.files.contains_key(&filename)
+    };
+    if !allowed {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let path = state
+        .cache
+        .get_file_path(
+            "node-pty",
+            &["versions", &version, "prebuilds", &platform, &filename],
+        )
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(body)
+        .unwrap())
+}
+
+async fn node_pty_checksums(
+    State(state): State<Arc<AppState>>,
+    Path(version): Path<String>,
+) -> Result<Response, StatusCode> {
+    let path = state
+        .cache
+        .get_file_path("node-pty", &["versions", &version, "checksums.json"])
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(content))
         .unwrap())
 }
 
@@ -405,26 +688,7 @@ async fn api_claude_code_versions(State(state): State<Arc<AppState>>) -> Json<Ve
 // API: Get checksums for all versions and platforms
 async fn api_claude_code_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let metadata = state.cache.get_metadata().await;
-    let provider = &metadata.claude_code;
-
-    let mut checksums = serde_json::Map::new();
-
-    for (version, version_meta) in &provider.versions {
-        let mut platforms = serde_json::Map::new();
-        for (platform, platform_meta) in &version_meta.platforms {
-            platforms.insert(
-                platform.clone(),
-                serde_json::json!({
-                    "sha256": platform_meta.sha256,
-                    "size": platform_meta.size,
-                    "filename": platform_meta.filename
-                }),
-            );
-        }
-        checksums.insert(version.clone(), serde_json::Value::Object(platforms));
-    }
-
-    Json(serde_json::Value::Object(checksums))
+    Json(provider_checksums_json(&metadata.claude_code))
 }
 
 // API: Refresh cache
@@ -456,26 +720,7 @@ async fn api_codex_versions(State(state): State<Arc<AppState>>) -> Json<Vec<Stri
 // API: Codex checksums
 async fn api_codex_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let metadata = state.cache.get_metadata().await;
-    let provider = &metadata.codex;
-
-    let mut checksums = serde_json::Map::new();
-
-    for (version, version_meta) in &provider.versions {
-        let mut platforms = serde_json::Map::new();
-        for (platform, platform_meta) in &version_meta.platforms {
-            platforms.insert(
-                platform.clone(),
-                serde_json::json!({
-                    "sha256": platform_meta.sha256,
-                    "size": platform_meta.size,
-                    "filename": platform_meta.filename
-                }),
-            );
-        }
-        checksums.insert(version.clone(), serde_json::Value::Object(platforms));
-    }
-
-    Json(serde_json::Value::Object(checksums))
+    Json(provider_checksums_json(&metadata.codex))
 }
 
 // API: Refresh Codex cache
@@ -494,6 +739,102 @@ async fn api_codex_refresh(
     }
 }
 
+// API: Gemini info
+async fn api_gemini_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.gemini.get_info().await)
+}
+
+// API: Gemini versions
+async fn api_gemini_versions(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+    Json(state.cache.list_versions("gemini").await)
+}
+
+// API: Gemini checksums
+async fn api_gemini_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let metadata = state.cache.get_metadata().await;
+    Json(provider_checksums_json(&metadata.gemini))
+}
+
+// API: Refresh Gemini cache
+async fn api_gemini_refresh(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match sync_gemini_locked(state.as_ref()).await {
+        Ok(updated) => Ok(Json(serde_json::json!({
+            "success": true,
+            "updated": updated
+        }))),
+        Err(e) => {
+            error!("Gemini refresh failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// API: Node info
+async fn api_node_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.node.get_info().await)
+}
+
+// API: Node versions
+async fn api_node_versions(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+    Json(state.cache.list_versions("node").await)
+}
+
+// API: Node checksums
+async fn api_node_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let metadata = state.cache.get_metadata().await;
+    Json(provider_checksums_json(&metadata.node))
+}
+
+// API: Refresh Node cache
+async fn api_node_refresh(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match sync_node_locked(state.as_ref()).await {
+        Ok(updated) => Ok(Json(serde_json::json!({
+            "success": true,
+            "updated": updated
+        }))),
+        Err(e) => {
+            error!("Node refresh failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// API: node-pty info
+async fn api_node_pty_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.node_pty.get_info().await)
+}
+
+// API: node-pty versions
+async fn api_node_pty_versions(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+    Json(state.cache.list_versions("node-pty").await)
+}
+
+// API: node-pty checksums
+async fn api_node_pty_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let metadata = state.cache.get_metadata().await;
+    Json(provider_checksums_json(&metadata.node_pty))
+}
+
+// API: Refresh node-pty cache
+async fn api_node_pty_refresh(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match sync_node_pty_locked(state.as_ref()).await {
+        Ok(updated) => Ok(Json(serde_json::json!({
+            "success": true,
+            "updated": updated
+        }))),
+        Err(e) => {
+            error!("node-pty refresh failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn sync_claude_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
     state.claude_code.sync_all().await
@@ -502,6 +843,21 @@ async fn sync_claude_locked(state: &AppState) -> Result<Vec<String>> {
 async fn sync_codex_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
     state.codex.sync_all().await
+}
+
+async fn sync_gemini_locked(state: &AppState) -> Result<Vec<String>> {
+    let _guard = state.sync_lock.lock().await;
+    state.gemini.sync_all().await
+}
+
+async fn sync_node_locked(state: &AppState) -> Result<Vec<String>> {
+    let _guard = state.sync_lock.lock().await;
+    state.node.sync_all().await
+}
+
+async fn sync_node_pty_locked(state: &AppState) -> Result<Vec<String>> {
+    let _guard = state.sync_lock.lock().await;
+    state.node_pty.sync_all().await
 }
 
 async fn sync_all_locked(state: &AppState) -> Result<()> {
@@ -514,12 +870,55 @@ async fn sync_all_locked(state: &AppState) -> Result<()> {
     if let Err(e) = state.codex.sync_all().await {
         errors.push(format!("codex: {}", e));
     }
+    if let Err(e) = state.gemini.sync_all().await {
+        errors.push(format!("gemini: {}", e));
+    }
+    if let Err(e) = state.node.sync_all().await {
+        errors.push(format!("node: {}", e));
+    }
+    if let Err(e) = state.node_pty.sync_all().await {
+        errors.push(format!("node-pty: {}", e));
+    }
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(anyhow::anyhow!(errors.join("; ")))
     }
+}
+
+fn provider_checksums_json(provider: &ProviderMetadata) -> serde_json::Value {
+    let mut checksums = serde_json::Map::new();
+
+    for (version, version_meta) in &provider.versions {
+        let mut platforms = serde_json::Map::new();
+        for (platform, platform_meta) in &version_meta.platforms {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "sha256".to_string(),
+                serde_json::Value::String(platform_meta.sha256.clone()),
+            );
+            entry.insert(
+                "size".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(platform_meta.size)),
+            );
+            entry.insert(
+                "filename".to_string(),
+                serde_json::Value::String(platform_meta.filename.clone()),
+            );
+
+            if !platform_meta.files.is_empty() {
+                if let Ok(files_value) = serde_json::to_value(&platform_meta.files) {
+                    entry.insert("files".to_string(), files_value);
+                }
+            }
+
+            platforms.insert(platform.clone(), serde_json::Value::Object(entry));
+        }
+        checksums.insert(version.clone(), serde_json::Value::Object(platforms));
+    }
+
+    serde_json::Value::Object(checksums)
 }
 
 // Generate install.sh script

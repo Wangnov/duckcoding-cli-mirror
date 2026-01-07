@@ -21,6 +21,14 @@ pub struct PlatformMetadata {
     pub sha256: String,
     pub size: u64,
     pub filename: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub files: HashMap<String, FileMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetadata {
+    pub sha256: String,
+    pub size: u64,
 }
 
 /// Provider-specific metadata
@@ -38,7 +46,12 @@ pub struct CacheMetadata {
     pub claude_code: ProviderMetadata,
     #[serde(default)]
     pub codex: ProviderMetadata,
-    // Future: gemini, node
+    #[serde(default)]
+    pub gemini: ProviderMetadata,
+    #[serde(default)]
+    pub node: ProviderMetadata,
+    #[serde(default)]
+    pub node_pty: ProviderMetadata,
 }
 
 /// Cache manager handles all file operations and metadata
@@ -144,6 +157,9 @@ impl CacheManager {
             let provider_metadata = match provider {
                 "claude-code" => &mut metadata.claude_code,
                 "codex" => &mut metadata.codex,
+                "gemini" => &mut metadata.gemini,
+                "node" => &mut metadata.node,
+                "node-pty" => &mut metadata.node_pty,
                 _ => return Err(anyhow::anyhow!("Unknown provider: {}", provider)),
             };
 
@@ -165,6 +181,9 @@ impl CacheManager {
         match provider {
             "claude-code" => metadata.claude_code.versions.keys().cloned().collect(),
             "codex" => metadata.codex.versions.keys().cloned().collect(),
+            "gemini" => metadata.gemini.versions.keys().cloned().collect(),
+            "node" => metadata.node.versions.keys().cloned().collect(),
+            "node-pty" => metadata.node_pty.versions.keys().cloned().collect(),
             _ => vec![],
         }
     }
@@ -178,6 +197,9 @@ impl CacheManager {
             let provider_metadata = match provider {
                 "claude-code" => &metadata.claude_code,
                 "codex" => &metadata.codex,
+                "gemini" => &metadata.gemini,
+                "node" => &metadata.node,
+                "node-pty" => &metadata.node_pty,
                 _ => return Ok(0),
             };
 
@@ -237,6 +259,9 @@ impl CacheManager {
                 let provider_metadata = match provider {
                     "claude-code" => &mut metadata.claude_code,
                     "codex" => &mut metadata.codex,
+                    "gemini" => &mut metadata.gemini,
+                    "node" => &mut metadata.node,
+                    "node-pty" => &mut metadata.node_pty,
                     _ => return Ok(0),
                 };
 

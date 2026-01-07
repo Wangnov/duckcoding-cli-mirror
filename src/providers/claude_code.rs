@@ -281,6 +281,7 @@ impl ClaudeCodeProvider {
                                 sha256: platform_manifest.checksum.clone(),
                                 size,
                                 filename: filename.to_string(),
+                                files: HashMap::new(),
                             },
                         );
                         info!(
@@ -333,6 +334,7 @@ impl ClaudeCodeProvider {
                             sha256: platform_manifest.checksum.clone(),
                             size: result.size,
                             filename: filename.to_string(),
+                            files: HashMap::new(),
                         },
                     );
 
