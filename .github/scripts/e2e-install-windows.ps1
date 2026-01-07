@@ -47,7 +47,7 @@ function Run-Cli {
     )
 
     Write-Host "==> Installing $Name"
-    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @("-NoModifyPath")
+    Invoke-RemoteScript "$env:MIRROR_URL/$Name/install.ps1" @("-NoModifyPath")
 
     Write-Host "==> Version check: $Bin"
     & $Bin --version
@@ -56,7 +56,7 @@ function Run-Cli {
     Invoke-TuiCheck $Bin
 
     Write-Host "==> Uninstalling $Name"
-    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/uninstall.ps1" -ScriptArgs $UninstallArgs
+    Invoke-RemoteScript "$env:MIRROR_URL/$Name/uninstall.ps1" $UninstallArgs
 
     if (Test-Path $Bin) {
         throw "Uninstall check failed: $Bin still exists"

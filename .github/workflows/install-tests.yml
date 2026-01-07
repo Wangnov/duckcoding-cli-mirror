@@ -55,11 +55,11 @@ jobs:
           - name: linux-x64-glibc
             platform: linux/amd64
             image: ubuntu:24.04
-            install_deps: apt-get update && apt-get install -y curl ca-certificates bash python3
+            install_deps: apt-get update && apt-get install -y curl ca-certificates bash python3 xz-utils
           - name: linux-arm64-glibc
             platform: linux/arm64
             image: ubuntu:24.04
-            install_deps: apt-get update && apt-get install -y curl ca-certificates bash python3
+            install_deps: apt-get update && apt-get install -y curl ca-certificates bash python3 xz-utils
           - name: linux-x64-musl
             platform: linux/amd64
             image: alpine:3.19
