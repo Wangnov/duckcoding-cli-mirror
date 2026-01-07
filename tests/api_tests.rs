@@ -247,8 +247,8 @@ fn test_uninstall_sh_content() {
     let script = include_str!("../scripts/claude-code-uninstall.sh");
 
     assert!(script.contains("INSTALL_DIR"));
-    assert!(script.contains("rm -rf"));
-    assert!(script.contains(".duckcoding"));
+    assert!(script.contains("rm -f"));
+    assert!(script.contains("remove_version_key"));
 }
 
 #[test]
