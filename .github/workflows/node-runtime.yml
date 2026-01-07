@@ -23,7 +23,7 @@ jobs:
       - name: Download Node.js runtimes
         run: |
           set -euo pipefail
-          BASE_URL="https://nodejs.org/dist/${NODE_DIST_TAG}"
+          BASE_URL="https://nodejs.org/download/release/${NODE_DIST_TAG}"
           mkdir -p out/node
 
           curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt
