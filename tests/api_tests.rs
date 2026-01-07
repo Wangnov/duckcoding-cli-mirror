@@ -7,7 +7,7 @@ use axum::{
 use duckcoding_cli_mirror::{
     cache::{CacheManager, PlatformMetadata, VersionMetadata},
     config::{CacheConfig, Config},
-    providers::{ClaudeCodeProvider, CodexProvider},
+    providers::{ClaudeCodeProvider, CodexProvider, GeminiProvider, NodeProvider, NodePtyProvider},
     server::{self, AppState},
 };
 use http_body_util::BodyExt;
@@ -38,12 +38,18 @@ fn create_test_state() -> (TempDir, Arc<AppState>) {
     let cache = Arc::new(cache);
     let provider = ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone());
     let codex = CodexProvider::new(config.codex.clone(), cache.clone());
+    let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone());
+    let node = NodeProvider::new(config.node.clone(), cache.clone());
+    let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone());
 
     let state = Arc::new(AppState {
         config,
         cache,
         claude_code: provider,
         codex,
+        gemini,
+        node,
+        node_pty,
         sync_lock: Mutex::new(()),
     });
 
@@ -142,6 +148,7 @@ async fn test_codex_tag_and_binary() {
                             sha256,
                             size: data.len() as u64,
                             filename: filename.to_string(),
+                            files: std::collections::HashMap::new(),
                         },
                     )]
                     .into_iter()
@@ -213,6 +220,7 @@ async fn test_codex_checksums_api() {
                             sha256: sha256.clone(),
                             size: data.len() as u64,
                             filename: filename.to_string(),
+                            files: std::collections::HashMap::new(),
                         },
                     )]
                     .into_iter()
