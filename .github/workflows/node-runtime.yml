@@ -37,9 +37,11 @@ jobs:
             fi
 
             if curl -fsS "${BASE_ROOT}/${NODE_DIST_TAG}/SHASUMS256.txt" -o out/node/SHASUMS256.txt; then
-              BASE_URL="${BASE_ROOT}/${NODE_DIST_TAG}"
               RAW_VERSION=$(grep -oE 'node-v[0-9]+\.[0-9]+\.[0-9]+' out/node/SHASUMS256.txt | head -1)
               NODE_VERSION="${RAW_VERSION#node-}"
+              NODE_VERSION="${NODE_VERSION#v}"
+              BASE_URL="${BASE_ROOT}/v${NODE_VERSION}"
+              curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt
               return
             fi
 
