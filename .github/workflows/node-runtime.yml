@@ -44,12 +44,38 @@ jobs:
             fi
 
             curl -fsS "${BASE_ROOT}/index.json" -o /tmp/node-index.json
-            NODE_VERSION=$(node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync('/tmp/node-index.json','utf8'));let match=data.find(x=>x.version.startsWith('v24.') && x.lts);if(!match) match=data.find(x=>x.version.startsWith('v24.')); if(!match){process.exit(1);} console.log(match.version.replace(/^v/,''));")
-            BASE_URL="${BASE_ROOT}/v${NODE_VERSION}"
-            curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt
+            mapfile -t versions < <(node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync('/tmp/node-index.json','utf8'));const lts=data.filter(x=>x.version.startsWith('v24.') && x.lts).map(x=>x.version);const non=data.filter(x=>x.version.startsWith('v24.')).map(x=>x.version);const list=(lts.length?lts:non); console.log(list.join('\\n'));")
+
+            for v in "${versions[@]}"; do
+              BASE_URL="${BASE_ROOT}/${v}"
+              if ! curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt; then
+                continue
+              fi
+              required=(
+                "node-${v}-linux-x64.tar.xz"
+                "node-${v}-linux-arm64.tar.xz"
+                "node-${v}-darwin-x64.tar.gz"
+                "node-${v}-darwin-arm64.tar.gz"
+                "node-${v}-win-x64.zip"
+                "node-${v}-win-arm64.zip"
+              )
+              missing=false
+              for f in "${required[@]}"; do
+                if ! grep -q " ${f}\$" out/node/SHASUMS256.txt; then
+                  missing=true
+                  break
+                fi
+              done
+              if [ "${missing}" = "false" ]; then
+                NODE_VERSION="${v#v}"
+                return
+              fi
+            done
+            echo "No suitable Node 24 release found with required artifacts" >&2
+            return 1
           }
 
-          resolve_version
+          resolve_version || exit 1
 
           if [ -z "${NODE_VERSION}" ]; then
             echo "Failed to detect Node.js version from SHASUMS256.txt"
@@ -59,6 +85,7 @@ jobs:
             echo "Failed to resolve Node.js base URL"
             exit 1
           fi
+          echo "Resolved Node.js ${NODE_VERSION} from ${BASE_URL}"
           echo "NODE_VERSION=${NODE_VERSION}" >> "$GITHUB_ENV"
 
           download() {
@@ -70,6 +97,7 @@ jobs:
             local actual
 
             mkdir -p "out/node/${platform}"
+            echo "Downloading ${url}"
             curl -fsS "${url}" -o "${dest}"
 
             expected=$(grep " ${filename}\$" out/node/SHASUMS256.txt | awk '{print $1}')
