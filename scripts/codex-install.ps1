@@ -1,6 +1,4 @@
 #Requires -Version 5.1
-$ErrorActionPreference = "Stop"
-
 param(
     [string]$Tag = "latest",
     [string]$Version = "",
@@ -9,6 +7,8 @@ param(
     [switch]$Check,
     [switch]$Force
 )
+
+$ErrorActionPreference = "Stop"
 
 $MirrorUrl = if ($env:MIRROR_URL) { $env:MIRROR_URL } else { "__MIRROR_URL__" }
 $InstallDir = "$env:USERPROFILE\.duckcoding"

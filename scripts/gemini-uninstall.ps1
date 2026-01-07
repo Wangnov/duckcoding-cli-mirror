@@ -1,6 +1,4 @@
 #Requires -Version 5.1
-$ErrorActionPreference = "Stop"
-
 param(
     [switch]$Yes,
     [switch]$RemoveNodePty,
@@ -8,6 +6,8 @@ param(
     [switch]$NoNodePty,
     [switch]$NoNode
 )
+
+$ErrorActionPreference = "Stop"
 
 $InstallDir = "$env:USERPROFILE\.duckcoding"
 $BinDir = "$InstallDir\bin"
