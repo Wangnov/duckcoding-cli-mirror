@@ -79,6 +79,7 @@ jobs:
                   cp build/Release/spawn-helper "${out_dir}/"
                   chmod +x "${out_dir}/spawn-helper"
                 fi
+                chmod -R a+rX "${out_dir}"
               '
           }
 
@@ -86,11 +87,6 @@ jobs:
           build_linux linux-arm64 linux/arm64 node:24-bookworm glibc
           build_linux linux-x64-musl linux/amd64 node:24-alpine musl
           build_linux linux-arm64-musl linux/arm64 node:24-alpine musl
-
-      - name: Fix permissions
-        run: |
-          set -euo pipefail
-          chmod -R a+rX out/node-pty
 
       - name: Generate checksums
         run: |
