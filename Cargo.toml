@@ -3,8 +3,8 @@ name = "duckcoding-cli-mirror"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A mirror service for CLI tools (Claude Code, Codex, Gemini CLI)"
-license = "MIT"
+description = "DuckCoding APP mirror service for AI Coding CLI tools (Claude Code, Codex, Gemini CLI)"
+license = "AGPL-3.0"
 
 [dependencies]
 # 异步运行时

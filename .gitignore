@@ -3,4 +3,3 @@
 *.log
 .env
 config.toml
-docs/
