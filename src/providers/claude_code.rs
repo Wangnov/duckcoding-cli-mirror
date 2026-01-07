@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::StreamExt;
-use reqwest::Client;
+use futures::{StreamExt, stream};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
 use crate::config::ClaudeCodeConfig;
 use crate::error::MirrorError;
+use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
 
 const PROVIDER_NAME: &str = "claude-code";
 
@@ -67,15 +68,18 @@ impl ClaudeCodeProvider {
         let url = format!("{}/{}", self.config.upstream_url, tag);
         info!("Fetching tag from upstream: {}", url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to fetch tag: {}", tag))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(MirrorError::VersionNotFound(tag.to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(
+                MirrorError::Provider(format!("Failed to fetch tag {}: {}", tag, status)).into(),
+            );
         }
 
         let version = response.text().await?.trim().to_string();
@@ -88,15 +92,20 @@ impl ClaudeCodeProvider {
         let url = format!("{}/{}/manifest.json", self.config.upstream_url, version);
         info!("Fetching manifest from upstream: {}", url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to fetch manifest for version: {}", version))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(MirrorError::VersionNotFound(version.to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to fetch manifest {}: {}",
+                version, status
+            ))
+            .into());
         }
 
         let manifest: Manifest = response.json().await?;
@@ -117,13 +126,20 @@ impl ClaudeCodeProvider {
         );
         info!("Downloading binary: {}", url);
 
-        let response =
-            self.client.get(&url).send().await.with_context(|| {
-                format!("Failed to download binary for {}/{}", version, platform)
-            })?;
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
+            .await
+            .with_context(|| format!("Failed to download binary for {}/{}", version, platform))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(MirrorError::PlatformNotFound(platform.to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to download binary for {}/{}: {}",
+                version, platform, status
+            ))
+            .into());
         }
 
         let mut file = tokio::fs::File::create(path).await?;
@@ -249,8 +265,14 @@ impl ClaudeCodeProvider {
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
         tokio::fs::write(&manifest_path, &manifest_json).await?;
 
-        // Download each configured platform
-        let mut platforms_metadata = HashMap::new();
+        #[derive(Clone)]
+        struct PlatformTask {
+            platform: String,
+            checksum: String,
+            filename: String,
+        }
+
+        let mut tasks = Vec::new();
         let mut failures = Vec::new();
 
         for platform in &self.config.platforms {
@@ -268,86 +290,119 @@ impl ClaudeCodeProvider {
                 "claude"
             };
 
-            let path = self
-                .cache
-                .binary_path(PROVIDER_NAME, version, platform, filename);
+            tasks.push(PlatformTask {
+                platform: platform.clone(),
+                checksum: platform_manifest.checksum.clone(),
+                filename: filename.to_string(),
+            });
+        }
 
-            if path.exists() {
-                match Self::verify_file_checksum(&path, &platform_manifest.checksum).await {
-                    Ok(size) => {
-                        platforms_metadata.insert(
-                            platform.clone(),
-                            PlatformMetadata {
-                                sha256: platform_manifest.checksum.clone(),
-                                size,
-                                filename: filename.to_string(),
-                                files: HashMap::new(),
-                            },
-                        );
-                        info!(
-                            "Binary verified: {}/{}/{} ({} bytes)",
-                            version, platform, filename, size
-                        );
-                        continue;
+        let concurrency = sync_concurrency();
+        let version_label = version.to_string();
+        let provider = self;
+        let mut platforms_metadata = HashMap::new();
+
+        let mut stream = stream::iter(tasks)
+            .map(|task| {
+                let version = version_label.clone();
+                async move {
+                    let path = provider.cache.binary_path(
+                        PROVIDER_NAME,
+                        &version,
+                        &task.platform,
+                        &task.filename,
+                    );
+
+                    if path.exists() {
+                        match Self::verify_file_checksum(&path, &task.checksum).await {
+                            Ok(size) => {
+                                info!(
+                                    "Binary verified: {}/{}/{} ({} bytes)",
+                                    version, task.platform, task.filename, size
+                                );
+                                return Ok((
+                                    task.platform,
+                                    PlatformMetadata {
+                                        sha256: task.checksum,
+                                        size,
+                                        filename: task.filename,
+                                        files: HashMap::new(),
+                                    },
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Existing binary checksum failed for {}/{}: {}",
+                                    version, task.platform, e
+                                );
+                                let _ = tokio::fs::remove_file(&path).await;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Existing binary checksum failed for {}/{}: {}",
-                            version, platform, e
-                        );
-                        let _ = tokio::fs::remove_file(&path).await;
-                    }
-                }
-            }
 
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-
-            match self
-                .download_binary_to_path(version, platform, filename, &path)
-                .await
-            {
-                Ok(result) => {
-                    if result.sha256 != platform_manifest.checksum {
-                        warn!(
-                            "Checksum verification failed for {}/{}: expected {}, got {}",
-                            version, platform, platform_manifest.checksum, result.sha256
-                        );
-                        let _ = tokio::fs::remove_file(&path).await;
-                        failures.push(format!("Checksum mismatch for {}", platform));
-                        continue;
+                    if let Some(parent) = path.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(|e| e.to_string())?;
                     }
 
-                    // Set executable permission on Unix
-                    #[cfg(unix)]
+                    match provider
+                        .download_binary_to_path(&version, &task.platform, &task.filename, &path)
+                        .await
                     {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = tokio::fs::metadata(&path).await?.permissions();
-                        perms.set_mode(0o755);
-                        tokio::fs::set_permissions(&path, perms).await?;
+                        Ok(result) => {
+                            if result.sha256 != task.checksum {
+                                warn!(
+                                    "Checksum verification failed for {}/{}: expected {}, got {}",
+                                    version, task.platform, task.checksum, result.sha256
+                                );
+                                let _ = tokio::fs::remove_file(&path).await;
+                                return Err(format!("Checksum mismatch for {}", task.platform));
+                            }
+
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mut perms = tokio::fs::metadata(&path)
+                                    .await
+                                    .map_err(|e| e.to_string())?
+                                    .permissions();
+                                perms.set_mode(0o755);
+                                tokio::fs::set_permissions(&path, perms)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                            }
+
+                            info!(
+                                "Saved binary: {}/{}/{} ({} bytes)",
+                                version, task.platform, task.filename, result.size
+                            );
+                            Ok((
+                                task.platform,
+                                PlatformMetadata {
+                                    sha256: task.checksum,
+                                    size: result.size,
+                                    filename: task.filename,
+                                    files: HashMap::new(),
+                                },
+                            ))
+                        }
+                        Err(e) => {
+                            warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                            let _ = tokio::fs::remove_file(&path).await;
+                            Err(format!("Download failed for {}", task.platform))
+                        }
                     }
-
-                    platforms_metadata.insert(
-                        platform.clone(),
-                        PlatformMetadata {
-                            sha256: platform_manifest.checksum.clone(),
-                            size: result.size,
-                            filename: filename.to_string(),
-                            files: HashMap::new(),
-                        },
-                    );
-
-                    info!(
-                        "Saved binary: {}/{}/{} ({} bytes)",
-                        version, platform, filename, result.size
-                    );
                 }
-                Err(e) => {
-                    warn!("Failed to download {}/{}: {}", version, platform, e);
-                    let _ = tokio::fs::remove_file(&path).await;
-                    failures.push(format!("Download failed for {}", platform));
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok((platform, meta)) => {
+                    platforms_metadata.insert(platform, meta);
                 }
+                Err(err) => failures.push(err),
             }
         }
 

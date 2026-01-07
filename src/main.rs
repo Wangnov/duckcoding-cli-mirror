@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod error;
 mod providers;
+mod retry;
 mod server;
 
 use anyhow::Result;

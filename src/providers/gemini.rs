@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
-use reqwest::{Client, header};
+use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
 use crate::config::GeminiConfig;
 use crate::error::MirrorError;
+use crate::retry::{RetryPolicy, send_with_retry};
 
 const PROVIDER_NAME: &str = "gemini";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -80,14 +81,18 @@ impl GeminiProvider {
 
     async fn fetch_releases(&self) -> Result<Vec<Release>> {
         let url = format!("{}/repos/{}/releases", GITHUB_API_BASE, self.config.repo);
-        let response = self
-            .api_request(&url)
-            .send()
+        let response = send_with_retry(|| self.api_request(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to fetch releases from {}", url))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(MirrorError::VersionNotFound("releases".to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(
+                MirrorError::Provider(format!("Failed to fetch releases: {}", status)).into(),
+            );
         }
 
         Ok(response.json::<Vec<Release>>().await?)
@@ -98,14 +103,20 @@ impl GeminiProvider {
             "{}/repos/{}/releases/tags/{}",
             GITHUB_API_BASE, self.config.repo, tag
         );
-        let response = self
-            .api_request(&url)
-            .send()
+        let response = send_with_retry(|| self.api_request(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to fetch release tag {}", tag))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(MirrorError::VersionNotFound(tag.to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to fetch release {}: {}",
+                tag, status
+            ))
+            .into());
         }
 
         Ok(response.json::<Release>().await?)
@@ -126,15 +137,18 @@ impl GeminiProvider {
     }
 
     async fn download_asset_to_path(&self, url: &str, path: &Path) -> Result<DownloadResult> {
-        let response = self
-            .client
-            .get(url)
-            .send()
+        let url = url.to_string();
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to download asset {}", url))?;
 
-        if !response.status().is_success() {
-            return Err(MirrorError::Provider(format!("Failed to download asset: {}", url)).into());
+        let status = response.status();
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to download asset {}: {}",
+                url, status
+            ))
+            .into());
         }
 
         let mut file = tokio::fs::File::create(path).await?;

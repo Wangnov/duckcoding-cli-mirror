@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::StreamExt;
-use reqwest::{Client, header};
+use futures::{StreamExt, stream};
+use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
 use crate::config::CodexConfig;
 use crate::error::MirrorError;
+use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
 
 const PROVIDER_NAME: &str = "codex";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -78,14 +79,18 @@ impl CodexProvider {
 
     async fn fetch_releases(&self) -> Result<Vec<Release>> {
         let url = format!("{}/repos/{}/releases", GITHUB_API_BASE, self.config.repo);
-        let response = self
-            .api_request(&url)
-            .send()
+        let response = send_with_retry(|| self.api_request(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to fetch releases from {}", url))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(MirrorError::VersionNotFound("releases".to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(
+                MirrorError::Provider(format!("Failed to fetch releases: {}", status)).into(),
+            );
         }
 
         let releases = response.json::<Vec<Release>>().await?;
@@ -97,14 +102,20 @@ impl CodexProvider {
             "{}/repos/{}/releases/tags/{}",
             GITHUB_API_BASE, self.config.repo, tag
         );
-        let response = self
-            .api_request(&url)
-            .send()
+        let response = send_with_retry(|| self.api_request(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to fetch release tag {}", tag))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
             return Err(MirrorError::VersionNotFound(tag.to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to fetch release {}: {}",
+                tag, status
+            ))
+            .into());
         }
 
         Ok(response.json::<Release>().await?)
@@ -148,15 +159,18 @@ impl CodexProvider {
     }
 
     async fn download_asset_to_path(&self, url: &str, path: &Path) -> Result<DownloadResult> {
-        let response = self
-            .client
-            .get(url)
-            .send()
+        let url = url.to_string();
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
             .await
             .with_context(|| format!("Failed to download asset {}", url))?;
 
-        if !response.status().is_success() {
-            return Err(MirrorError::Provider(format!("Failed to download asset: {}", url)).into());
+        let status = response.status();
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to download asset {}: {}",
+                url, status
+            ))
+            .into());
         }
 
         let mut file = tokio::fs::File::create(path).await?;
@@ -268,7 +282,16 @@ impl CodexProvider {
         let metadata = self.cache.get_metadata().await;
         let existing_version = metadata.codex.versions.get(version);
 
-        let mut platforms_metadata = HashMap::new();
+        #[derive(Clone)]
+        struct PlatformTask {
+            platform: String,
+            asset_name: String,
+            asset_url: String,
+            asset_digest: Option<String>,
+            expected_existing: Option<String>,
+        }
+
+        let mut tasks = Vec::new();
         let mut failures = Vec::new();
 
         for platform in &self.config.platforms {
@@ -288,88 +311,117 @@ impl CodexProvider {
                 }
             };
 
-            let path = self
-                .cache
-                .binary_path(PROVIDER_NAME, version, platform, &asset.name);
+            let asset_digest = Self::asset_digest_sha256(asset).map(str::to_string);
+            let expected_existing = existing_version
+                .and_then(|version_meta| version_meta.platforms.get(platform))
+                .map(|meta| meta.sha256.clone())
+                .or_else(|| asset_digest.clone());
 
-            if path.exists() {
-                let expected = existing_version
-                    .and_then(|version_meta| version_meta.platforms.get(platform))
-                    .map(|meta| meta.sha256.clone())
-                    .or_else(|| Self::asset_digest_sha256(asset).map(str::to_string));
+            tasks.push(PlatformTask {
+                platform: platform.clone(),
+                asset_name: asset.name.clone(),
+                asset_url: asset.browser_download_url.clone(),
+                asset_digest,
+                expected_existing,
+            });
+        }
 
-                if let Some(expected) = expected {
-                    match Self::verify_file_checksum(&path, &expected).await {
-                        Ok(size) => {
-                            platforms_metadata.insert(
-                                platform.clone(),
-                                PlatformMetadata {
-                                    sha256: expected,
-                                    size,
-                                    filename: asset.name.clone(),
-                                    files: HashMap::new(),
-                                },
-                            );
-                            info!(
-                                "Asset verified: {}/{}/{} ({} bytes)",
-                                version, platform, asset.name, size
-                            );
-                            continue;
+        let concurrency = sync_concurrency();
+        let version_label = version.to_string();
+        let provider = self;
+        let mut platforms_metadata = HashMap::new();
+
+        let mut stream = stream::iter(tasks)
+            .map(|task| {
+                let version = version_label.clone();
+                async move {
+                let path = provider.cache.binary_path(
+                    PROVIDER_NAME,
+                    &version,
+                    &task.platform,
+                    &task.asset_name,
+                );
+
+                if path.exists() {
+                    if let Some(expected) = &task.expected_existing {
+                        match Self::verify_file_checksum(&path, expected).await {
+                            Ok(size) => {
+                                info!(
+                                    "Asset verified: {}/{}/{} ({} bytes)",
+                                    version, task.platform, task.asset_name, size
+                                );
+                                return Ok((
+                                    task.platform,
+                                    PlatformMetadata {
+                                        sha256: expected.clone(),
+                                        size,
+                                        filename: task.asset_name,
+                                        files: HashMap::new(),
+                                    },
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Existing asset checksum failed for {}/{}: {}",
+                                    version, task.platform, e
+                                );
+                                let _ = tokio::fs::remove_file(&path).await;
+                            }
                         }
-                        Err(e) => {
-                            warn!(
-                                "Existing asset checksum failed for {}/{}: {}",
-                                version, platform, e
-                            );
-                            let _ = tokio::fs::remove_file(&path).await;
-                        }
+                    } else {
+                        let _ = tokio::fs::remove_file(&path).await;
                     }
-                } else {
-                    let _ = tokio::fs::remove_file(&path).await;
+                }
+
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+
+                match provider.download_asset_to_path(&task.asset_url, &path).await {
+                    Ok(result) => {
+                        if let Some(expected) = task.asset_digest.as_deref() {
+                            if result.sha256 != expected {
+                                warn!(
+                                    "Checksum verification failed for {}/{}: expected {}, got {}",
+                                    version, task.platform, expected, result.sha256
+                                );
+                                let _ = tokio::fs::remove_file(&path).await;
+                                return Err(format!("Checksum mismatch for {}", task.platform));
+                            }
+                        }
+
+                        info!(
+                            "Saved asset: {}/{}/{} ({} bytes)",
+                            version, task.platform, task.asset_name, result.size
+                        );
+                        Ok((
+                            task.platform,
+                            PlatformMetadata {
+                                sha256: result.sha256,
+                                size: result.size,
+                                filename: task.asset_name,
+                                files: HashMap::new(),
+                            },
+                        ))
+                    }
+                    Err(e) => {
+                        warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                        let _ = tokio::fs::remove_file(&path).await;
+                        Err(format!("Download failed for {}", task.platform))
+                    }
                 }
             }
+            })
+            .buffer_unordered(concurrency);
 
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-
-            match self
-                .download_asset_to_path(&asset.browser_download_url, &path)
-                .await
-            {
-                Ok(result) => {
-                    if let Some(expected) = Self::asset_digest_sha256(asset) {
-                        if result.sha256 != expected {
-                            warn!(
-                                "Checksum verification failed for {}/{}: expected {}, got {}",
-                                version, platform, expected, result.sha256
-                            );
-                            let _ = tokio::fs::remove_file(&path).await;
-                            failures.push(format!("Checksum mismatch for {}", platform));
-                            continue;
-                        }
-                    }
-
-                    platforms_metadata.insert(
-                        platform.clone(),
-                        PlatformMetadata {
-                            sha256: result.sha256,
-                            size: result.size,
-                            filename: asset.name.clone(),
-                            files: HashMap::new(),
-                        },
-                    );
-
-                    info!(
-                        "Saved asset: {}/{}/{} ({} bytes)",
-                        version, platform, asset.name, result.size
-                    );
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok((platform, meta)) => {
+                    platforms_metadata.insert(platform, meta);
                 }
-                Err(e) => {
-                    warn!("Failed to download {}/{}: {}", version, platform, e);
-                    let _ = tokio::fs::remove_file(&path).await;
-                    failures.push(format!("Download failed for {}", platform));
-                }
+                Err(err) => failures.push(err),
             }
         }
 
