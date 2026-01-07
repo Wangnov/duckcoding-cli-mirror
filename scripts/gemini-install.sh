@@ -16,7 +16,15 @@ CHECK_ONLY=false
 
 # Detect language (zh = Chinese, otherwise English)
 detect_lang() {
-    local lang="${LANG:-${LC_ALL:-en}}"
+    local lang="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+
+    # macOS: fallback to AppleLocale if LANG is empty or C/POSIX
+    if [[ -z "$lang" || "$lang" == "C" || "$lang" == "C.UTF-8" || "$lang" == "POSIX" ]]; then
+        if command -v defaults &>/dev/null; then
+            lang=$(defaults read -g AppleLocale 2>/dev/null || true)
+        fi
+    fi
+
     if [[ "$lang" == zh* ]]; then
         echo "zh"
     else
