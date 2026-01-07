@@ -47,7 +47,7 @@ function Run-Cli {
     )
 
     Write-Host "==> Installing $Name"
-    Invoke-RemoteScript "$env:MIRROR_URL/$Name/install.ps1" @("-NoModifyPath")
+    Invoke-RemoteScript "$env:MIRROR_URL/$Name/install.ps1" "-NoModifyPath"
 
     Write-Host "==> Version check: $Bin"
     & $Bin --version
@@ -65,4 +65,4 @@ function Run-Cli {
 
 Run-Cli -Name "claude-code" -Bin "$BinDir\claude.exe"
 Run-Cli -Name "codex" -Bin "$BinDir\codex.exe"
-Run-Cli -Name "gemini" -Bin "$BinDir\gemini.cmd" -UninstallArgs @("-Yes")
+Run-Cli -Name "gemini" -Bin "$BinDir\gemini.cmd" -UninstallArgs "-Yes"
