@@ -2,34 +2,96 @@
 set -e
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.duckcoding}"
+BIN_DIR="$INSTALL_DIR/bin"
 
-echo "Uninstalling DuckCoding CLI tools..."
+detect_lang() {
+    local lang="${LANG:-${LC_ALL:-en}}"
+    if [[ "$lang" == zh* ]]; then
+        echo "zh"
+    else
+        echo "en"
+    fi
+}
 
-# Remove installation directory
-if [[ -d "$INSTALL_DIR" ]]; then
-    rm -rf "$INSTALL_DIR"
-    echo "Removed $INSTALL_DIR"
+LANG_CODE=$(detect_lang)
+
+msg() {
+    local key="$1"
+    shift
+    case "$LANG_CODE" in
+        zh)
+            case "$key" in
+                "uninstalling") printf "正在卸载 Claude Code...\n" ;;
+                "removed")      printf "已删除: %s\n" "$1" ;;
+                "complete")     printf "卸载完成!\n" ;;
+            esac
+            ;;
+        *)
+            case "$key" in
+                "uninstalling") printf "Uninstalling Claude Code...\n" ;;
+                "removed")      printf "Removed: %s\n" "$1" ;;
+                "complete")     printf "Uninstallation complete!\n" ;;
+            esac
+            ;;
+    esac
+}
+
+remove_version_key() {
+    local key="$1"
+    local version_file="$INSTALL_DIR/versions.json"
+    if [[ ! -f "$version_file" ]]; then
+        return
+    fi
+
+    if command -v jq &> /dev/null; then
+        local tmp_json
+        tmp_json="$(mktemp)"
+        jq "del(.\"$key\")" "$version_file" > "$tmp_json" && mv "$tmp_json" "$version_file"
+    elif command -v python3 &> /dev/null; then
+        python3 - "$version_file" "$key" <<'PY'
+import json
+import sys
+path, key = sys.argv[1:3]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data.pop(key, None)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+    elif command -v python &> /dev/null; then
+        python - "$version_file" "$key" <<'PY'
+import json
+import sys
+path, key = sys.argv[1:3]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data.pop(key, None)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+    fi
+}
+
+msg "uninstalling"
+
+if [[ -f "$BIN_DIR/claude" ]]; then
+    rm -f "$BIN_DIR/claude"
+    msg "removed" "$BIN_DIR/claude"
 fi
 
-# Remove symlinks from ~/.local/bin
-for cmd in claude codex gemini; do
-    if [[ -L "$HOME/.local/bin/$cmd" ]]; then
-        rm -f "$HOME/.local/bin/$cmd"
-        echo "Removed symlink ~/.local/bin/$cmd"
-    fi
-done
+if [[ -L "$HOME/.local/bin/claude" ]]; then
+    rm -f "$HOME/.local/bin/claude"
+    msg "removed" "$HOME/.local/bin/claude"
+fi
 
-# Clean up shell config
-for rc_file in ~/.bashrc ~/.zshrc ~/.profile; do
-    if [[ -f "$rc_file" ]]; then
-        if grep -q ".duckcoding" "$rc_file" 2>/dev/null; then
-            # Create backup and remove lines
-            sed -i.bak '/.duckcoding/d' "$rc_file"
-            rm -f "$rc_file.bak"
-            echo "Cleaned up $rc_file"
-        fi
-    fi
-done
+remove_version_key "claude"
 
-echo "Uninstallation complete!"
-echo "Please restart your terminal or run: source ~/.bashrc (or ~/.zshrc)"
+if [[ -d "$BIN_DIR" ]] && [[ -z "$(ls -A "$BIN_DIR")" ]]; then
+    rmdir "$BIN_DIR" 2>/dev/null || true
+fi
+
+if [[ -d "$INSTALL_DIR" ]] && [[ -z "$(ls -A "$INSTALL_DIR")" ]]; then
+    rmdir "$INSTALL_DIR" 2>/dev/null || true
+fi
+
+msg "complete"
