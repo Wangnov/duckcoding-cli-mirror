@@ -23,13 +23,34 @@ jobs:
       - name: Download Node.js runtimes
         run: |
           set -euo pipefail
-          BASE_URL="https://nodejs.org/download/release/${NODE_DIST_TAG}"
+          BASE_ROOT="https://nodejs.org/dist"
           mkdir -p out/node
 
-          curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt
+          resolve_version() {
+            if [[ "${NODE_DIST_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              BASE_URL="${BASE_ROOT}/${NODE_DIST_TAG}"
+              curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt
+              RAW_VERSION="${NODE_DIST_TAG#v}"
+              echo "${RAW_VERSION}"
+              return
+            fi
 
-          RAW_VERSION=$(grep -oE 'node-v[0-9]+\.[0-9]+\.[0-9]+' out/node/SHASUMS256.txt | head -1)
-          NODE_VERSION="${RAW_VERSION#node-}"
+            if curl -fsS "${BASE_ROOT}/${NODE_DIST_TAG}/SHASUMS256.txt" -o out/node/SHASUMS256.txt; then
+              BASE_URL="${BASE_ROOT}/${NODE_DIST_TAG}"
+              RAW_VERSION=$(grep -oE 'node-v[0-9]+\.[0-9]+\.[0-9]+' out/node/SHASUMS256.txt | head -1)
+              echo "${RAW_VERSION#node-}"
+              return
+            fi
+
+            curl -fsS "${BASE_ROOT}/index.json" -o /tmp/node-index.json
+            RAW_VERSION=$(node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync('/tmp/node-index.json','utf8'));let match=data.find(x=>x.version.startsWith('v24.') && x.lts);if(!match) match=data.find(x=>x.version.startsWith('v24.')); if(!match){process.exit(1);} console.log(match.version.replace(/^v/,''));")
+            BASE_URL="${BASE_ROOT}/v${RAW_VERSION}"
+            curl -fsS "${BASE_URL}/SHASUMS256.txt" -o out/node/SHASUMS256.txt
+            echo "${RAW_VERSION}"
+          }
+
+          NODE_VERSION=$(resolve_version)
+
           if [ -z "${NODE_VERSION}" ]; then
             echo "Failed to detect Node.js version from SHASUMS256.txt"
             exit 1
