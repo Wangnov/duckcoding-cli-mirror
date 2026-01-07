@@ -6,6 +6,21 @@ if [[ -z "${MIRROR_URL:-}" ]]; then
   exit 1
 fi
 
+is_musl() {
+  if command -v ldd >/dev/null 2>&1; then
+    if ldd --version 2>&1 | grep -qi musl; then
+      return 0
+    fi
+  fi
+  if ls /lib/ld-musl-* >/dev/null 2>&1; then
+    return 0
+  fi
+  if ls /lib/libc.musl-* >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 tui_check() {
   local bin="$1"
   if command -v python3 >/dev/null 2>&1; then
@@ -83,4 +98,8 @@ run_cli() {
 
 run_cli "claude-code" "claude"
 run_cli "codex" "codex"
-run_cli "gemini" "gemini" "--yes"
+if is_musl; then
+  echo "Skipping gemini on musl: Node.js runtime not available"
+else
+  run_cli "gemini" "gemini" "--yes"
+fi

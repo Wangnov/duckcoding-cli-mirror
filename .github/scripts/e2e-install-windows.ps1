@@ -11,12 +11,12 @@ $BinDir = "$InstallDir\bin"
 function Invoke-RemoteScript {
     param(
         [Parameter(Mandatory=$true)][string]$Url,
-        [string[]]$Args = @()
+        [string[]]$ScriptArgs = @()
     )
 
     $tmp = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName() + ".ps1")
     Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
-    & $tmp @Args
+    & $tmp @ScriptArgs
     Remove-Item $tmp -Force
 }
 
@@ -47,7 +47,7 @@ function Run-Cli {
     )
 
     Write-Host "==> Installing $Name"
-    Invoke-RemoteScript "$env:MIRROR_URL/$Name/install.ps1" @("-NoModifyPath")
+    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @("-NoModifyPath")
 
     Write-Host "==> Version check: $Bin"
     & $Bin --version
@@ -56,7 +56,7 @@ function Run-Cli {
     Invoke-TuiCheck $Bin
 
     Write-Host "==> Uninstalling $Name"
-    Invoke-RemoteScript "$env:MIRROR_URL/$Name/uninstall.ps1" $UninstallArgs
+    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/uninstall.ps1" -ScriptArgs $UninstallArgs
 
     if (Test-Path $Bin) {
         throw "Uninstall check failed: $Bin still exists"
