@@ -138,15 +138,23 @@ if ($ActualSha256 -ne $ExpectedSha256) {
 }
 Msg "checksum_ok"
 
-# Save version info
-$VersionInfo = @{
-    claude = @{
-        version = $Version
-        tag = $Tag
-        installed_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+# Save version info (update instead of overwrite)
+$VersionInfo = @{}
+if (Test-Path $VersionFile) {
+    try {
+        $VersionInfo = Get-Content $VersionFile | ConvertFrom-Json
+    } catch {
+        $VersionInfo = @{}
     }
 }
-$VersionInfo | ConvertTo-Json | Set-Content "$InstallDir\versions.json"
+
+$VersionInfo | Add-Member -NotePropertyName "claude" -NotePropertyValue @{
+    version = $Version
+    tag = $Tag
+    installed_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+} -Force
+
+$VersionInfo | ConvertTo-Json -Depth 6 | Set-Content $VersionFile
 
 Msg "installed_to" $Version "$BinDir\claude.exe"
 

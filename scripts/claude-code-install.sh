@@ -143,11 +143,26 @@ if [[ -z "$VERSION" ]]; then
 fi
 msg "version" "$VERSION"
 
-# Check current version
-CURRENT_VERSION=""
-if [[ -f "$INSTALL_DIR/versions.json" ]]; then
-    CURRENT_VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$INSTALL_DIR/versions.json" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
-fi
+# Get installed version from versions.json by key
+get_installed_version() {
+    local key="$1"
+    local version_file="$INSTALL_DIR/versions.json"
+    if [[ ! -f "$version_file" ]]; then
+        return
+    fi
+
+    if command -v jq &> /dev/null; then
+        jq -r --arg k "$key" '.[$k].version // empty' "$version_file"
+    elif command -v python3 &> /dev/null; then
+        python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); print((data.get(sys.argv[2], {}) or {}).get("version", ""))' "$version_file" "$key"
+    elif command -v python &> /dev/null; then
+        python -c 'import json,sys; data=json.load(open(sys.argv[1])); print((data.get(sys.argv[2], {}) or {}).get("version", ""))' "$version_file" "$key"
+    else
+        grep -A3 "\"$key\"" "$version_file" 2>/dev/null | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true
+    fi
+}
+
+CURRENT_VERSION=$(get_installed_version claude || true)
 
 # Check only mode
 if $CHECK_ONLY; then
@@ -224,16 +239,48 @@ msg "checksum_ok"
 
 chmod +x "$BIN_DIR/claude"
 
-# Save version info
-cat > "$INSTALL_DIR/versions.json" << VERSIONS_EOF
+# Save version info (update instead of overwrite)
+VERSION_FILE="$INSTALL_DIR/versions.json"
+TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+if command -v jq &> /dev/null && [[ -f "$VERSION_FILE" ]]; then
+    tmp_json="$(mktemp)"
+    jq --arg v "$VERSION" --arg t "$TAG" --arg ts "$TS" \
+        '.claude = {"version":$v,"tag":$t,"installed_at":$ts}' \
+        "$VERSION_FILE" > "$tmp_json" && mv "$tmp_json" "$VERSION_FILE"
+elif command -v python3 &> /dev/null && [[ -f "$VERSION_FILE" ]]; then
+    python3 - "$VERSION_FILE" "$VERSION" "$TAG" "$TS" <<'PY'
+import json
+import sys
+path, version, tag, ts = sys.argv[1:5]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data["claude"] = {"version": version, "tag": tag, "installed_at": ts}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+elif command -v python &> /dev/null && [[ -f "$VERSION_FILE" ]]; then
+    python - "$VERSION_FILE" "$VERSION" "$TAG" "$TS" <<'PY'
+import json
+import sys
+path, version, tag, ts = sys.argv[1:5]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data["claude"] = {"version": version, "tag": tag, "installed_at": ts}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+else
+    cat > "$VERSION_FILE" << VERSIONS_EOF
 {
   "claude": {
     "version": "$VERSION",
     "tag": "$TAG",
-    "installed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    "installed_at": "$TS"
   }
 }
 VERSIONS_EOF
+fi
 
 msg "installed_to" "$VERSION" "$BIN_DIR/claude"
 
