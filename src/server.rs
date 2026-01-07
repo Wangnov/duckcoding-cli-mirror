@@ -123,6 +123,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Gemini routes
         .route("/gemini/{tag}", get(gemini_tag))
         .route("/gemini/{version}/gemini.js", get(gemini_binary))
+        .route("/gemini/install.sh", get(gemini_install_sh))
+        .route("/gemini/install.ps1", get(gemini_install_ps1))
+        .route("/gemini/uninstall.sh", get(gemini_uninstall_sh))
+        .route("/gemini/uninstall.ps1", get(gemini_uninstall_ps1))
         // Node runtime routes
         .route("/node/{tag}", get(node_tag))
         .route("/node/{version}/{platform}/{filename}", get(node_binary))
@@ -675,6 +679,62 @@ async fn codex_uninstall_ps1() -> impl IntoResponse {
         .unwrap()
 }
 
+// Install script for Gemini (Linux/macOS)
+async fn gemini_install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(mirror_url) = state.config.server.public_url.clone() else {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("server.public_url is not configured"))
+            .unwrap();
+    };
+
+    let script = generate_gemini_install_sh(&mirror_url);
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/x-shellscript")
+        .body(Body::from(script))
+        .unwrap()
+}
+
+// Install script for Gemini (Windows)
+async fn gemini_install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(mirror_url) = state.config.server.public_url.clone() else {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("server.public_url is not configured"))
+            .unwrap();
+    };
+
+    let script = generate_gemini_install_ps1(&mirror_url);
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(script))
+        .unwrap()
+}
+
+// Uninstall script for Gemini (Linux/macOS)
+async fn gemini_uninstall_sh() -> impl IntoResponse {
+    let script = generate_gemini_uninstall_sh();
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/x-shellscript")
+        .body(Body::from(script))
+        .unwrap()
+}
+
+// Uninstall script for Gemini (Windows)
+async fn gemini_uninstall_ps1() -> impl IntoResponse {
+    let script = generate_gemini_uninstall_ps1();
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(script))
+        .unwrap()
+}
+
 // API: Get info
 async fn api_claude_code_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(state.claude_code.get_info().await)
@@ -959,4 +1019,22 @@ fn generate_codex_uninstall_sh() -> String {
 
 fn generate_codex_uninstall_ps1() -> String {
     include_str!("../scripts/codex-uninstall.ps1").to_string()
+}
+
+fn generate_gemini_install_sh(mirror_url: &str) -> String {
+    const SCRIPT: &str = include_str!("../scripts/gemini-install.sh");
+    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+}
+
+fn generate_gemini_install_ps1(mirror_url: &str) -> String {
+    const SCRIPT: &str = include_str!("../scripts/gemini-install.ps1");
+    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+}
+
+fn generate_gemini_uninstall_sh() -> String {
+    include_str!("../scripts/gemini-uninstall.sh").to_string()
+}
+
+fn generate_gemini_uninstall_ps1() -> String {
+    include_str!("../scripts/gemini-uninstall.ps1").to_string()
 }
