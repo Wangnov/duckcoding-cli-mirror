@@ -47,7 +47,7 @@ function Run-Cli {
     )
 
     Write-Host "==> Installing $Name"
-    Invoke-RemoteScript "$env:MIRROR_URL/$Name/install.ps1" "-NoModifyPath"
+    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @("-NoModifyPath")
 
     Write-Host "==> Version check: $Bin"
     & $Bin --version
@@ -56,7 +56,7 @@ function Run-Cli {
     Invoke-TuiCheck $Bin
 
     Write-Host "==> Uninstalling $Name"
-    Invoke-RemoteScript "$env:MIRROR_URL/$Name/uninstall.ps1" $UninstallArgs
+    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/uninstall.ps1" -ScriptArgs $UninstallArgs
 
     if (Test-Path $Bin) {
         throw "Uninstall check failed: $Bin still exists"
@@ -65,4 +65,4 @@ function Run-Cli {
 
 Run-Cli -Name "claude-code" -Bin "$BinDir\claude.exe"
 Run-Cli -Name "codex" -Bin "$BinDir\codex.exe"
-Run-Cli -Name "gemini" -Bin "$BinDir\gemini.cmd" -UninstallArgs "-Yes"
+Run-Cli -Name "gemini" -Bin "$BinDir\gemini.cmd" -UninstallArgs @("-Yes")
