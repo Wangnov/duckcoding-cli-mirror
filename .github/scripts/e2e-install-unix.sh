@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${MIRROR_URL:-}" ]]; then
+  echo "MIRROR_URL is required" >&2
+  exit 1
+fi
+
+tui_check() {
+  local bin="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    BIN="$bin" python3 - <<'PY'
+import os
+import pty
+import signal
+import sys
+import time
+
+bin_path = os.environ["BIN"]
+pid, _ = pty.fork()
+if pid == 0:
+    os.execv(bin_path, [bin_path])
+
+time.sleep(2)
+pid_out, _ = os.waitpid(pid, os.WNOHANG)
+if pid_out != 0:
+    sys.exit(1)
+
+try:
+    os.kill(pid, signal.SIGTERM)
+except ProcessLookupError:
+    sys.exit(0)
+
+time.sleep(0.5)
+pid_out, _ = os.waitpid(pid, os.WNOHANG)
+if pid_out == 0:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+sys.exit(0)
+PY
+  elif command -v timeout >/dev/null 2>&1 && command -v script >/dev/null 2>&1; then
+    set +e
+    timeout 5s script -q -c "$bin" /dev/null
+    code=$?
+    set -e
+    if [[ "$code" -ne 124 && "$code" -ne 137 && "$code" -ne 143 ]]; then
+      return 1
+    fi
+  else
+    echo "No tool available for TUI check (need python3 or timeout+script)" >&2
+    return 1
+  fi
+}
+
+run_cli() {
+  local name="$1"
+  local cmd="$2"
+  local uninstall_args="${3:-}"
+
+  echo "==> Installing $name"
+  curl -fsSL "$MIRROR_URL/$name/install.sh" | bash -s -- --no-modify-path
+
+  echo "==> Version check: $cmd"
+  "$HOME/.duckcoding/bin/$cmd" --version
+
+  echo "==> TUI check: $cmd"
+  tui_check "$HOME/.duckcoding/bin/$cmd"
+
+  echo "==> Uninstalling $name"
+  if [[ -n "$uninstall_args" ]]; then
+    curl -fsSL "$MIRROR_URL/$name/uninstall.sh" | bash -s -- $uninstall_args
+  else
+    curl -fsSL "$MIRROR_URL/$name/uninstall.sh" | bash
+  fi
+
+  if [[ -e "$HOME/.duckcoding/bin/$cmd" ]]; then
+    echo "Uninstall check failed: $cmd still exists" >&2
+    exit 1
+  fi
+}
+
+run_cli "claude-code" "claude"
+run_cli "codex" "codex"
+run_cli "gemini" "gemini" "--yes"
