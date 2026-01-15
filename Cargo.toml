@@ -1,6 +1,6 @@
 [package]
 name = "duckcoding-cli-mirror"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "DuckCoding APP mirror service for AI Coding CLI tools (Claude Code, Codex, Gemini CLI)"
