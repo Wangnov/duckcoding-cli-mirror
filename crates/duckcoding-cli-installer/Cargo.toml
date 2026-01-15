@@ -1,0 +1,27 @@
+[package]
+name = "duckcoding-cli-installer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "DuckCoding CLI installer"
+license = "AGPL-3.0"
+repository = "https://github.com/wangnov/duckcoding-cli-mirror"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29.0"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "stream", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+tar = "0.4"
+flate2 = "1.0"
+xz2 = "0.1"
+time = { version = "0.3", features = ["formatting"] }
+zip = "7.0"
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2.2"

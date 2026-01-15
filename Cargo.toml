@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "DuckCoding APP mirror service for AI Coding CLI tools (Claude Code, Codex, Gemini CLI)"
 license = "AGPL-3.0"
+repository = "https://github.com/wangnov/duckcoding-cli-mirror"
 
 [dependencies]
 # 异步运行时
@@ -49,3 +50,17 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1.0", features = ["full"] }
 http-body-util = "0.1"
+
+[workspace]
+members = ["crates/duckcoding-cli-installer"]
+resolver = "2"
+
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
+publish = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
