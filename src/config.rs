@@ -24,6 +24,9 @@ pub struct Config {
     pub gemini: GeminiConfig,
 
     #[serde(default)]
+    pub installer: InstallerConfig,
+
+    #[serde(default)]
     pub node: NodeConfig,
 
     #[serde(default)]
@@ -293,6 +296,43 @@ fn default_gemini_include_prerelease() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallerConfig {
+    #[serde(default = "default_installer_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_installer_tags")]
+    pub tags: Vec<String>,
+
+    #[serde(default = "default_installer_platforms")]
+    pub platforms: Vec<String>,
+}
+
+impl Default for InstallerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_installer_enabled(),
+            tags: default_installer_tags(),
+            platforms: default_installer_platforms(),
+        }
+    }
+}
+
+fn default_installer_enabled() -> bool {
+    std::env::var("MIRROR_INSTALLER_ENABLED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true)
+}
+
+fn default_installer_tags() -> Vec<String> {
+    vec!["latest".to_string()]
+}
+
+fn default_installer_platforms() -> Vec<String> {
+    default_codex_platforms()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     #[serde(default = "default_node_enabled")]
     pub enabled: bool,
@@ -486,6 +526,16 @@ repo = "openai/codex"
     #[test]
     fn test_default_codex_platforms() {
         let platforms = default_codex_platforms();
+        assert!(platforms.contains(&"darwin-arm64".to_string()));
+        assert!(platforms.contains(&"linux-x64".to_string()));
+        assert!(platforms.contains(&"win32-x64".to_string()));
+        assert!(platforms.contains(&"win32-arm64".to_string()));
+        assert_eq!(platforms.len(), 8);
+    }
+
+    #[test]
+    fn test_default_installer_platforms() {
+        let platforms = default_installer_platforms();
         assert!(platforms.contains(&"darwin-arm64".to_string()));
         assert!(platforms.contains(&"linux-x64".to_string()));
         assert!(platforms.contains(&"win32-x64".to_string()));

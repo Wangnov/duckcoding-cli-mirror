@@ -18,7 +18,8 @@ use tracing::{error, info, warn};
 use crate::cache::{CacheManager, ProviderMetadata};
 use crate::config::Config;
 use crate::providers::{
-    ClaudeCodeProvider, CodexProvider, GeminiProvider, NodeProvider, NodePtyProvider,
+    ClaudeCodeProvider, CodexProvider, GeminiProvider, InstallerProvider, NodeProvider,
+    NodePtyProvider,
 };
 
 /// Shared application state
@@ -28,6 +29,7 @@ pub struct AppState {
     pub claude_code: ClaudeCodeProvider,
     pub codex: CodexProvider,
     pub gemini: GeminiProvider,
+    pub installer: InstallerProvider,
     pub node: NodeProvider,
     pub node_pty: NodePtyProvider,
     pub sync_lock: Mutex<()>,
@@ -40,6 +42,7 @@ pub async fn run(config: Config, cache: CacheManager) -> Result<()> {
     let claude_code = ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone());
     let codex = CodexProvider::new(config.codex.clone(), cache.clone());
     let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone());
+    let installer = InstallerProvider::new(config.installer.clone(), cache.clone());
     let node = NodeProvider::new(config.node.clone(), cache.clone());
     let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone());
 
@@ -49,6 +52,7 @@ pub async fn run(config: Config, cache: CacheManager) -> Result<()> {
         claude_code,
         codex,
         gemini,
+        installer,
         node,
         node_pty,
         sync_lock: Mutex::new(()),
@@ -127,6 +131,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/gemini/install.ps1", get(gemini_install_ps1))
         .route("/gemini/uninstall.sh", get(gemini_uninstall_sh))
         .route("/gemini/uninstall.ps1", get(gemini_uninstall_ps1))
+        // Installer routes
+        .route("/installer/{tag}", get(installer_tag))
+        .route(
+            "/installer/{version}/{platform}/{filename}",
+            get(installer_binary),
+        )
+        .route(
+            "/installer/{version}/{platform}/checksum.txt",
+            get(installer_checksum_txt),
+        )
         // Node runtime routes
         .route("/node/{tag}", get(node_tag))
         .route("/node/{version}/{platform}/{filename}", get(node_binary))
@@ -155,6 +169,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/gemini/versions", get(api_gemini_versions))
         .route("/api/gemini/checksums", get(api_gemini_checksums))
         .route("/api/gemini/refresh", post(api_gemini_refresh))
+        .route("/api/installer/info", get(api_installer_info))
+        .route("/api/installer/versions", get(api_installer_versions))
+        .route("/api/installer/checksums", get(api_installer_checksums))
+        .route("/api/installer/refresh", post(api_installer_refresh))
         .route("/api/node/info", get(api_node_info))
         .route("/api/node/versions", get(api_node_versions))
         .route("/api/node/checksums", get(api_node_checksums))
@@ -219,6 +237,22 @@ async fn gemini_tag(
 
     state
         .gemini
+        .get_tag_version(&tag)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// Get Installer tag version
+async fn installer_tag(
+    State(state): State<Arc<AppState>>,
+    Path(tag): Path<String>,
+) -> Result<String, StatusCode> {
+    if tag != "stable" && tag != "latest" {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    state
+        .installer
         .get_tag_version(&tag)
         .await
         .ok_or(StatusCode::NOT_FOUND)
@@ -403,6 +437,77 @@ async fn gemini_binary(
             "attachment; filename=\"gemini.js\"",
         )
         .body(body)
+        .unwrap())
+}
+
+// Download installer binary
+async fn installer_binary(
+    State(state): State<Arc<AppState>>,
+    Path((version, platform, filename)): Path<(String, String, String)>,
+) -> Result<Response, StatusCode> {
+    let metadata = state.cache.get_metadata().await;
+    let provider = &metadata.installer;
+    let version_meta = provider
+        .versions
+        .get(&version)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let platform_meta = version_meta
+        .platforms
+        .get(&platform)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if platform_meta.filename != filename {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let path = state
+        .cache
+        .get_file_path("installer", &["versions", &version, &platform, &filename])
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(body)
+        .unwrap())
+}
+
+// Installer checksum helper
+async fn installer_checksum_txt(
+    State(state): State<Arc<AppState>>,
+    Path((version, platform)): Path<(String, String)>,
+) -> Result<Response, StatusCode> {
+    let metadata = state.cache.get_metadata().await;
+    let provider = &metadata.installer;
+    let version_meta = provider
+        .versions
+        .get(&version)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let platform_meta = version_meta
+        .platforms
+        .get(&platform)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let body = format!("{}  {}\n", platform_meta.sha256, platform_meta.filename);
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(body))
         .unwrap())
 }
 
@@ -831,6 +936,38 @@ async fn api_gemini_refresh(
     }
 }
 
+// API: Installer info
+async fn api_installer_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.installer.get_info().await)
+}
+
+// API: Installer versions
+async fn api_installer_versions(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+    Json(state.cache.list_versions("installer").await)
+}
+
+// API: Installer checksums
+async fn api_installer_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let metadata = state.cache.get_metadata().await;
+    Json(provider_checksums_json(&metadata.installer))
+}
+
+// API: Refresh installer cache
+async fn api_installer_refresh(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match sync_installer_locked(state.as_ref()).await {
+        Ok(updated) => Ok(Json(serde_json::json!({
+            "success": true,
+            "updated": updated
+        }))),
+        Err(e) => {
+            error!("Installer refresh failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 // API: Node info
 async fn api_node_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(state.node.get_info().await)
@@ -910,6 +1047,11 @@ async fn sync_gemini_locked(state: &AppState) -> Result<Vec<String>> {
     state.gemini.sync_all().await
 }
 
+async fn sync_installer_locked(state: &AppState) -> Result<Vec<String>> {
+    let _guard = state.sync_lock.lock().await;
+    state.installer.sync_all().await
+}
+
 async fn sync_node_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
     state.node.sync_all().await
@@ -932,6 +1074,9 @@ async fn sync_all_locked(state: &AppState) -> Result<()> {
     }
     if let Err(e) = state.gemini.sync_all().await {
         errors.push(format!("gemini: {}", e));
+    }
+    if let Err(e) = state.installer.sync_all().await {
+        errors.push(format!("installer: {}", e));
     }
     if let Err(e) = state.node.sync_all().await {
         errors.push(format!("node: {}", e));

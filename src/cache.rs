@@ -49,6 +49,8 @@ pub struct CacheMetadata {
     #[serde(default)]
     pub gemini: ProviderMetadata,
     #[serde(default)]
+    pub installer: ProviderMetadata,
+    #[serde(default)]
     pub node: ProviderMetadata,
     #[serde(default)]
     pub node_pty: ProviderMetadata,
@@ -158,6 +160,7 @@ impl CacheManager {
                 "claude-code" => &mut metadata.claude_code,
                 "codex" => &mut metadata.codex,
                 "gemini" => &mut metadata.gemini,
+                "installer" => &mut metadata.installer,
                 "node" => &mut metadata.node,
                 "node-pty" => &mut metadata.node_pty,
                 _ => return Err(anyhow::anyhow!("Unknown provider: {}", provider)),
@@ -182,6 +185,7 @@ impl CacheManager {
             "claude-code" => metadata.claude_code.versions.keys().cloned().collect(),
             "codex" => metadata.codex.versions.keys().cloned().collect(),
             "gemini" => metadata.gemini.versions.keys().cloned().collect(),
+            "installer" => metadata.installer.versions.keys().cloned().collect(),
             "node" => metadata.node.versions.keys().cloned().collect(),
             "node-pty" => metadata.node_pty.versions.keys().cloned().collect(),
             _ => vec![],

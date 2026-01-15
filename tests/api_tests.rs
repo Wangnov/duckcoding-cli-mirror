@@ -7,7 +7,10 @@ use axum::{
 use duckcoding_cli_mirror::{
     cache::{CacheManager, PlatformMetadata, VersionMetadata},
     config::{CacheConfig, Config},
-    providers::{ClaudeCodeProvider, CodexProvider, GeminiProvider, NodeProvider, NodePtyProvider},
+    providers::{
+        ClaudeCodeProvider, CodexProvider, GeminiProvider, InstallerProvider, NodeProvider,
+        NodePtyProvider,
+    },
     server::{self, AppState},
 };
 use http_body_util::BodyExt;
@@ -39,6 +42,7 @@ fn create_test_state() -> (TempDir, Arc<AppState>) {
     let provider = ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone());
     let codex = CodexProvider::new(config.codex.clone(), cache.clone());
     let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone());
+    let installer = InstallerProvider::new(config.installer.clone(), cache.clone());
     let node = NodeProvider::new(config.node.clone(), cache.clone());
     let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone());
 
@@ -48,6 +52,7 @@ fn create_test_state() -> (TempDir, Arc<AppState>) {
         claude_code: provider,
         codex,
         gemini,
+        installer,
         node,
         node_pty,
         sync_lock: Mutex::new(()),
@@ -78,8 +83,9 @@ fn test_install_sh_content() {
     // Check for key features
     assert!(script.contains("MIRROR_URL"));
     assert!(script.contains("detect_platform"));
-    assert!(script.contains("sha256")); // SHA256 verification
-    assert!(script.contains("LANG_CODE")); // i18n support
+    assert!(script.contains("checksum.txt")); // checksum verification
+    assert!(script.contains("duckcoding-cli-installer")); // bootstrap installer
+    assert!(script.contains("INSTALLER_TAG"));
 }
 
 #[test]
@@ -89,8 +95,9 @@ fn test_install_ps1_content() {
     // Check for key features
     assert!(script.contains("$MirrorUrl"));
     assert!(script.contains("Get-FileHash")); // SHA256 verification
-    assert!(script.contains("$LangCode")); // i18n support
-    assert!(script.contains("$ProxyUrl")); // Proxy support
+    assert!(script.contains("checksum.txt")); // checksum verification
+    assert!(script.contains("$InstallerTag")); // bootstrap installer
+    assert!(script.contains("duckcoding-cli-installer.exe"));
 }
 
 #[test]
@@ -100,7 +107,8 @@ fn test_codex_install_sh_content() {
     assert!(script.contains("MIRROR_URL"));
     assert!(script.contains("detect_platform"));
     assert!(script.contains("codex"));
-    assert!(script.contains("api/codex/checksums"));
+    assert!(script.contains("installer/"));
+    assert!(script.contains("duckcoding-cli-installer"));
 }
 
 #[test]
@@ -108,8 +116,9 @@ fn test_codex_install_ps1_content() {
     let script = include_str!("../scripts/codex-install.ps1");
 
     assert!(script.contains("$MirrorUrl"));
-    assert!(script.contains("api/codex/checksums"));
     assert!(script.contains("Get-FileHash"));
+    assert!(script.contains("installer/"));
+    assert!(script.contains("duckcoding-cli-installer.exe"));
 }
 
 #[tokio::test]
