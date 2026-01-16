@@ -225,6 +225,13 @@ jobs:
             throw "mirror not ready"
           }
 
+          .github/scripts/e2e-install-windows.ps1
+          if (Test-Path mirror.pid) {
+            $mirrorPid = Get-Content mirror.pid
+            Stop-Process -Id $mirrorPid -Force -ErrorAction SilentlyContinue
+          }
+          "WINDOWS_TESTS_DONE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Unix install tests
         if: startsWith(matrix.os, 'macos')
         shell: bash
@@ -233,7 +240,7 @@ jobs:
           bash .github/scripts/e2e-install-unix.sh
 
       - name: Windows install tests
-        if: startsWith(matrix.os, 'windows')
+        if: startsWith(matrix.os, 'windows') && env.WINDOWS_TESTS_DONE != 'true'
         shell: pwsh
         run: |
           .github/scripts/e2e-install-windows.ps1
@@ -247,7 +254,7 @@ jobs:
           fi
 
       - name: Stop mirror (Windows)
-        if: always() && startsWith(matrix.os, 'windows')
+        if: always() && startsWith(matrix.os, 'windows') && env.WINDOWS_TESTS_DONE != 'true'
         shell: pwsh
         run: |
           if (Test-Path mirror.pid) {
