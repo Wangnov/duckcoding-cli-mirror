@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "duckcoding-cli-installer"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "duckcoding-cli-mirror"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
