@@ -76,7 +76,7 @@ run_cli() {
   local uninstall_args="${3:-}"
 
   echo "==> Installing $name"
-  curl -fsSL "$MIRROR_URL/$name/install.sh" | bash -s -- --no-modify-path --mirror-url "$MIRROR_URL"
+  curl -fsSL "$MIRROR_URL/$name/install.sh" | env MIRROR_URL="$MIRROR_URL" bash -s -- --no-modify-path
 
   echo "==> Version check: $cmd"
   "$HOME/.duckcoding/bin/$cmd" --version
@@ -99,7 +99,9 @@ run_cli() {
 
 run_cli "claude-code" "claude"
 run_cli "codex" "codex"
-if is_musl; then
+if [[ "${SKIP_GEMINI:-}" == "1" ]]; then
+  echo "Skipping gemini: SKIP_GEMINI=1"
+elif is_musl; then
   echo "Skipping gemini on musl: Node.js runtime not available"
 else
   run_cli "gemini" "gemini" "--yes"
