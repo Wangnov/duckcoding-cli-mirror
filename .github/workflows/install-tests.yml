@@ -55,34 +55,34 @@ jobs:
           tar -xJf "$tmp/$mirror_asset"
           chmod +x duckcoding-cli-mirror
 
-          cat > config.ci.toml <<'EOF'
-[server]
-host = "127.0.0.1"
-port = 1357
-public_url = "http://127.0.0.1:1357"
-
-[cache]
-dir = "./cache"
-max_versions = 1
-
-[update]
-enabled = false
-interval_minutes = 10
-
-[installer]
-enabled = true
-tags = ["latest"]
-platforms = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-gnu",
-  "x86_64-unknown-linux-musl",
-  "aarch64-pc-windows-msvc",
-  "x86_64-pc-windows-msvc"
-]
-EOF
+          printf '%s\n' \
+            '[server]' \
+            'host = "127.0.0.1"' \
+            'port = 1357' \
+            'public_url = "http://127.0.0.1:1357"' \
+            '' \
+            '[cache]' \
+            'dir = "./cache"' \
+            'max_versions = 1' \
+            '' \
+            '[update]' \
+            'enabled = false' \
+            'interval_minutes = 10' \
+            '' \
+            '[installer]' \
+            'enabled = true' \
+            'tags = ["latest"]' \
+            'platforms = [' \
+            '  "aarch64-apple-darwin",' \
+            '  "x86_64-apple-darwin",' \
+            '  "aarch64-unknown-linux-gnu",' \
+            '  "aarch64-unknown-linux-musl",' \
+            '  "x86_64-unknown-linux-gnu",' \
+            '  "x86_64-unknown-linux-musl",' \
+            '  "aarch64-pc-windows-msvc",' \
+            '  "x86_64-pc-windows-msvc"' \
+            ']' \
+            > config.ci.toml
 
           ./duckcoding-cli-mirror --config config.ci.toml &
           echo $! > mirror.pid
@@ -109,34 +109,35 @@ EOF
           $exe = Get-ChildItem -Path . -Recurse -Filter "duckcoding-cli-mirror.exe" | Select-Object -First 1
           if (-not $exe) { throw "duckcoding-cli-mirror.exe not found" }
 
-          @'
-[server]
-host = "127.0.0.1"
-port = 1357
-public_url = "http://127.0.0.1:1357"
-
-[cache]
-dir = "./cache"
-max_versions = 1
-
-[update]
-enabled = false
-interval_minutes = 10
-
-[installer]
-enabled = true
-tags = ["latest"]
-platforms = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-gnu",
-  "x86_64-unknown-linux-musl",
-  "aarch64-pc-windows-msvc",
-  "x86_64-pc-windows-msvc"
-]
-'@ | Set-Content -Path config.ci.toml -Encoding utf8
+          $config = @(
+            '[server]'
+            'host = "127.0.0.1"'
+            'port = 1357'
+            'public_url = "http://127.0.0.1:1357"'
+            ''
+            '[cache]'
+            'dir = "./cache"'
+            'max_versions = 1'
+            ''
+            '[update]'
+            'enabled = false'
+            'interval_minutes = 10'
+            ''
+            '[installer]'
+            'enabled = true'
+            'tags = ["latest"]'
+            'platforms = ['
+            '  "aarch64-apple-darwin",'
+            '  "x86_64-apple-darwin",'
+            '  "aarch64-unknown-linux-gnu",'
+            '  "aarch64-unknown-linux-musl",'
+            '  "x86_64-unknown-linux-gnu",'
+            '  "x86_64-unknown-linux-musl",'
+            '  "aarch64-pc-windows-msvc",'
+            '  "x86_64-pc-windows-msvc"'
+            ']'
+          ) -join "`n"
+          $config | Set-Content -Path config.ci.toml -Encoding utf8
 
           $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--config","config.ci.toml" -PassThru
           $proc.Id | Set-Content mirror.pid
@@ -223,34 +224,34 @@ platforms = [
           tar -xJf "$tmp/duckcoding-cli-mirror-x86_64-unknown-linux-gnu.tar.xz"
           chmod +x duckcoding-cli-mirror
 
-          cat > config.ci.toml <<'EOF'
-[server]
-host = "127.0.0.1"
-port = 1357
-public_url = "http://127.0.0.1:1357"
-
-[cache]
-dir = "./cache"
-max_versions = 1
-
-[update]
-enabled = false
-interval_minutes = 10
-
-[installer]
-enabled = true
-tags = ["latest"]
-platforms = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-gnu",
-  "x86_64-unknown-linux-musl",
-  "aarch64-pc-windows-msvc",
-  "x86_64-pc-windows-msvc"
-]
-EOF
+          printf '%s\n' \
+            '[server]' \
+            'host = "127.0.0.1"' \
+            'port = 1357' \
+            'public_url = "http://127.0.0.1:1357"' \
+            '' \
+            '[cache]' \
+            'dir = "./cache"' \
+            'max_versions = 1' \
+            '' \
+            '[update]' \
+            'enabled = false' \
+            'interval_minutes = 10' \
+            '' \
+            '[installer]' \
+            'enabled = true' \
+            'tags = ["latest"]' \
+            'platforms = [' \
+            '  "aarch64-apple-darwin",' \
+            '  "x86_64-apple-darwin",' \
+            '  "aarch64-unknown-linux-gnu",' \
+            '  "aarch64-unknown-linux-musl",' \
+            '  "x86_64-unknown-linux-gnu",' \
+            '  "x86_64-unknown-linux-musl",' \
+            '  "aarch64-pc-windows-msvc",' \
+            '  "x86_64-pc-windows-msvc"' \
+            ']' \
+            > config.ci.toml
 
           ./duckcoding-cli-mirror --config config.ci.toml &
           echo $! > mirror.pid
