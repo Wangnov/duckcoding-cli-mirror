@@ -46,8 +46,8 @@ if (-not $MirrorUrl -or $MirrorUrl -eq "__MIRROR_URL__") {
 
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower()
 switch ($arch) {
-    "x64" { $Platform = "win32-x64" }
-    "arm64" { $Platform = "win32-arm64" }
+    "x64" { $Platform = "x86_64-pc-windows-msvc" }
+    "arm64" { $Platform = "aarch64-pc-windows-msvc" }
     Default {
         Write-Error "Unsupported architecture: $arch"
         exit 1
@@ -58,19 +58,37 @@ if (-not $InstallerVersion) {
     $InstallerVersion = Invoke-RestMethod "$MirrorUrl/installer/$InstallerTag"
 }
 
-$InstallerName = "duckcoding-cli-installer.exe"
+$InstallerExeName = "duckcoding-cli-installer.exe"
 $TempDir = Join-Path $env:TEMP "duckcoding-installer-$([guid]::NewGuid().ToString('N').Substring(0,8))"
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
-$InstallerPath = Join-Path $TempDir $InstallerName
 
 try {
-    Invoke-WebRequest -Uri "$MirrorUrl/installer/$InstallerVersion/$Platform/$InstallerName" -OutFile $InstallerPath
     $ChecksumLine = Invoke-RestMethod "$MirrorUrl/installer/$InstallerVersion/$Platform/checksum.txt"
-    $Expected = ($ChecksumLine -split "\s+")[0].ToLower()
-    $Actual = (Get-FileHash $InstallerPath -Algorithm SHA256).Hash.ToLower()
+    $ChecksumParts = $ChecksumLine -split "\s+"
+    $Expected = $ChecksumParts[0].ToLower()
+    $ArchiveName = $ChecksumParts[1]
+    if (-not $ArchiveName) {
+        Write-Error "Failed to resolve installer filename"
+        exit 1
+    }
+
+    $ArchivePath = Join-Path $TempDir $ArchiveName
+    Invoke-WebRequest -Uri "$MirrorUrl/installer/$InstallerVersion/$Platform/$ArchiveName" -OutFile $ArchivePath
+    $Actual = (Get-FileHash $ArchivePath -Algorithm SHA256).Hash.ToLower()
     if ($Expected -and $Actual -ne $Expected) {
         Write-Error "Checksum mismatch: expected $Expected, got $Actual"
         exit 1
+    }
+
+    $InstallerPath = $ArchivePath
+    if ($ArchiveName.ToLower().EndsWith(".zip")) {
+        Expand-Archive -Path $ArchivePath -DestinationPath $TempDir -Force
+        $InstallerPath = Get-ChildItem -Path $TempDir -Recurse -Filter $InstallerExeName | Select-Object -First 1
+        if (-not $InstallerPath) {
+            Write-Error "Installer binary not found after extraction"
+            exit 1
+        }
+        $InstallerPath = $InstallerPath.FullName
     }
 
     $installerArgs = @("--mirror-url", $MirrorUrl, "--install-dir", $InstallDir, "claude-code", "--tag", $Tag)
