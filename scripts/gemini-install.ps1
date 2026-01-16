@@ -36,6 +36,7 @@ for ($i = 0; $i -lt $ArgsList.Count; $i++) {
         "--check" { $CheckOnly = $true }
         "--no-modify-path" { $NoModifyPath = $true }
         "--json" { $Json = $true }
+        "--mirror-url" { $MirrorUrl = $ArgsList[++$i] }
         "--installer-tag" { $InstallerTag = $ArgsList[++$i] }
         "--installer-version" { $InstallerVersion = $ArgsList[++$i] }
         "-h" { exit 0 }

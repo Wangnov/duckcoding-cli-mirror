@@ -2,6 +2,7 @@
 set -e
 
 MIRROR_URL="${MIRROR_URL:-__MIRROR_URL__}"
+MIRROR_URL_OVERRIDE=""
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.duckcoding}"
 TAG="${TAG:-latest}"
 VERSION=""
@@ -22,6 +23,7 @@ Usage: claude-code-install.sh [options]
   --check                  check only
   --no-modify-path         do not modify PATH
   --json                   JSON output from installer
+  --mirror-url <url>       override mirror url
   --installer-tag <tag>    installer tag (default: latest)
   --installer-version <v>  installer version
 EOF
@@ -53,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             JSON=true
             shift
             ;;
+        --mirror-url)
+            MIRROR_URL_OVERRIDE="$2"
+            shift 2
+            ;;
         --installer-tag)
             INSTALLER_TAG="$2"
             shift 2
@@ -72,6 +78,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$MIRROR_URL_OVERRIDE" ]]; then
+    MIRROR_URL="$MIRROR_URL_OVERRIDE"
+fi
 
 if [[ -z "$MIRROR_URL" || "$MIRROR_URL" == "__MIRROR_URL__" ]]; then
     echo "MIRROR_URL is not set" >&2
