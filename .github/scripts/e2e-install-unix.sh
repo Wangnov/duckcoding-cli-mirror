@@ -7,6 +7,8 @@ if [[ -z "${MIRROR_URL:-}" ]]; then
 fi
 export MIRROR_URL
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 is_musl() {
   if command -v ldd >/dev/null 2>&1; then
     if ldd --version 2>&1 | grep -qi musl; then
@@ -74,11 +76,12 @@ run_cli() {
   local name="$1"
   local cmd="$2"
   local uninstall_args="${3:-}"
+  local install_script="$ROOT_DIR/scripts/${name}-install.sh"
+  local uninstall_script="$ROOT_DIR/scripts/${name}-uninstall.sh"
 
   echo "==> Installing $name"
-  curl -fsSL "$MIRROR_URL/$name/install.sh" \
-    | sed "s|__MIRROR_URL__|$MIRROR_URL|g" \
-    | bash -s -- --no-modify-path
+  curl -fsSL "$MIRROR_URL/$name/install.sh" >/dev/null
+  MIRROR_URL="$MIRROR_URL" bash "$install_script" --no-modify-path
 
   echo "==> Version check: $cmd"
   "$HOME/.duckcoding/bin/$cmd" --version
@@ -87,10 +90,11 @@ run_cli() {
   tui_check "$HOME/.duckcoding/bin/$cmd"
 
   echo "==> Uninstalling $name"
+  curl -fsSL "$MIRROR_URL/$name/uninstall.sh" >/dev/null
   if [[ -n "$uninstall_args" ]]; then
-    curl -fsSL "$MIRROR_URL/$name/uninstall.sh" | bash -s -- $uninstall_args
+    bash "$uninstall_script" $uninstall_args
   else
-    curl -fsSL "$MIRROR_URL/$name/uninstall.sh" | bash
+    bash "$uninstall_script"
   fi
 
   if [[ -e "$HOME/.duckcoding/bin/$cmd" ]]; then

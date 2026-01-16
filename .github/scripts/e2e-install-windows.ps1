@@ -7,21 +7,7 @@ if (-not $env:MIRROR_URL) {
 
 $InstallDir = "$env:USERPROFILE\.duckcoding"
 $BinDir = "$InstallDir\bin"
-
-function Invoke-RemoteScript {
-    param(
-        [Parameter(Mandatory=$true)][string]$Url,
-        [string[]]$ScriptArgs = @()
-    )
-
-    $tmp = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName() + ".ps1")
-    Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
-    $content = Get-Content $tmp -Raw
-    $content = $content -replace "__MIRROR_URL__", $env:MIRROR_URL
-    Set-Content -Path $tmp -Value $content -NoNewline
-    & $tmp @ScriptArgs
-    Remove-Item $tmp -Force
-}
+$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot ".." "..")
 
 function Invoke-TuiCheck {
     param(
@@ -50,7 +36,9 @@ function Run-Cli {
     )
 
     Write-Host "==> Installing $Name"
-    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @("--no-modify-path")
+    Invoke-WebRequest -Uri "$env:MIRROR_URL/$Name/install.ps1" -UseBasicParsing | Out-Null
+    $installScript = Join-Path $RepoRoot ("scripts\" + $Name + "-install.ps1")
+    & $installScript @("--no-modify-path")
 
     Write-Host "==> Version check: $Bin"
     & $Bin --version
@@ -59,7 +47,9 @@ function Run-Cli {
     Invoke-TuiCheck $Bin
 
     Write-Host "==> Uninstalling $Name"
-    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/uninstall.ps1" -ScriptArgs $UninstallArgs
+    Invoke-WebRequest -Uri "$env:MIRROR_URL/$Name/uninstall.ps1" -UseBasicParsing | Out-Null
+    $uninstallScript = Join-Path $RepoRoot ("scripts\" + $Name + "-uninstall.ps1")
+    & $uninstallScript @UninstallArgs
 
     if (Test-Path $Bin) {
         throw "Uninstall check failed: $Bin still exists"
