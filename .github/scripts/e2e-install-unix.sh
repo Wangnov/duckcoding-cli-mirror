@@ -5,6 +5,7 @@ if [[ -z "${MIRROR_URL:-}" ]]; then
   echo "MIRROR_URL is required" >&2
   exit 1
 fi
+export MIRROR_URL
 
 is_musl() {
   if command -v ldd >/dev/null 2>&1; then
@@ -75,7 +76,7 @@ run_cli() {
   local uninstall_args="${3:-}"
 
   echo "==> Installing $name"
-  curl -fsSL "$MIRROR_URL/$name/install.sh" | bash -s -- --no-modify-path
+  curl -fsSL "$MIRROR_URL/$name/install.sh" | bash -s -- --no-modify-path --mirror-url "$MIRROR_URL"
 
   echo "==> Version check: $cmd"
   "$HOME/.duckcoding/bin/$cmd" --version

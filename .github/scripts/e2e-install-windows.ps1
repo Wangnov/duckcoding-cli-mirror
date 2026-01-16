@@ -47,7 +47,7 @@ function Run-Cli {
     )
 
     Write-Host "==> Installing $Name"
-    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @("--no-modify-path")
+    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @("--no-modify-path", "--mirror-url", $env:MIRROR_URL)
 
     Write-Host "==> Version check: $Bin"
     & $Bin --version
