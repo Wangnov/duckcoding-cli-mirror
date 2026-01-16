@@ -76,7 +76,9 @@ run_cli() {
   local uninstall_args="${3:-}"
 
   echo "==> Installing $name"
-  curl -fsSL "$MIRROR_URL/$name/install.sh" | env MIRROR_URL="$MIRROR_URL" bash -s -- --no-modify-path
+  curl -fsSL "$MIRROR_URL/$name/install.sh" \
+    | sed "s|__MIRROR_URL__|$MIRROR_URL|g" \
+    | bash -s -- --no-modify-path
 
   echo "==> Version check: $cmd"
   "$HOME/.duckcoding/bin/$cmd" --version

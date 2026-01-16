@@ -16,6 +16,9 @@ function Invoke-RemoteScript {
 
     $tmp = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName() + ".ps1")
     Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
+    $content = Get-Content $tmp -Raw
+    $content = $content -replace "__MIRROR_URL__", $env:MIRROR_URL
+    Set-Content -Path $tmp -Value $content -NoNewline
     & $tmp @ScriptArgs
     Remove-Item $tmp -Force
 }
