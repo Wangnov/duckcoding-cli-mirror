@@ -24,13 +24,17 @@ jobs:
         include:
           - os: macos-15-intel
             name: macos-x64
+            skip_codex: false
           - os: macos-latest
             name: macos-arm64
+            skip_codex: true
           - os: windows-latest
             name: windows-x64
+            skip_codex: false
     env:
       MIRROR_URL: http://127.0.0.1:1357
       SKIP_GEMINI: "1"
+      SKIP_CODEX: ${{ matrix.skip_codex && '1' || '' }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
