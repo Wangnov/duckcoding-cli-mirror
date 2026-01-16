@@ -16,7 +16,7 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # HTTP 客户端
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # 序列化
 serde = { version = "1.0", features = ["derive"] }
