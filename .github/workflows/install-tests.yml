@@ -29,9 +29,125 @@ jobs:
           - os: windows-latest
             name: windows-x64
     env:
-      MIRROR_URL: http://${{ secrets.PUBLIC_URL }}:1357
+      MIRROR_URL: http://127.0.0.1:1357
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare mirror (macOS)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --json tagName -q .tagName)"
+          version="${tag#v}"
+          tmp="$(mktemp -d)"
+          gh release download "$tag" -p "duckcoding-cli-installer-*" -D "$tmp"
+          gh release download "$tag" -p "duckcoding-cli-mirror-*" -D "$tmp"
+          python3 .github/scripts/prepare-installer-cache.py --assets-dir "$tmp" --cache-dir ./cache --version "$version"
+
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64) mirror_asset="duckcoding-cli-mirror-x86_64-apple-darwin.tar.xz" ;;
+            arm64) mirror_asset="duckcoding-cli-mirror-aarch64-apple-darwin.tar.xz" ;;
+            *) echo "Unsupported arch: $arch" >&2; exit 1 ;;
+          esac
+          tar -xJf "$tmp/$mirror_asset"
+          chmod +x duckcoding-cli-mirror
+
+          cat > config.ci.toml <<'EOF'
+[server]
+host = "127.0.0.1"
+port = 1357
+public_url = "http://127.0.0.1:1357"
+
+[cache]
+dir = "./cache"
+max_versions = 1
+
+[update]
+enabled = false
+interval_minutes = 10
+
+[installer]
+enabled = true
+tags = ["latest"]
+platforms = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-pc-windows-msvc",
+  "x86_64-pc-windows-msvc"
+]
+EOF
+
+          ./duckcoding-cli-mirror --config config.ci.toml &
+          echo $! > mirror.pid
+          for _ in {1..30}; do
+            if curl -fsS http://127.0.0.1:1357/api/installer/info >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Prepare mirror (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          $tag = gh release view --json tagName -q .tagName
+          $version = $tag.TrimStart('v')
+          $tmp = Join-Path $env:TEMP ("installer-assets-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          gh release download $tag -p "duckcoding-cli-installer-*" -D $tmp
+          gh release download $tag -p "duckcoding-cli-mirror-x86_64-pc-windows-msvc.zip" -D $tmp
+          python .github/scripts/prepare-installer-cache.py --assets-dir $tmp --cache-dir ./cache --version $version
+
+          Expand-Archive -Path (Join-Path $tmp "duckcoding-cli-mirror-x86_64-pc-windows-msvc.zip") -DestinationPath . -Force
+          $exe = Get-ChildItem -Path . -Recurse -Filter "duckcoding-cli-mirror.exe" | Select-Object -First 1
+          if (-not $exe) { throw "duckcoding-cli-mirror.exe not found" }
+
+          @'
+[server]
+host = "127.0.0.1"
+port = 1357
+public_url = "http://127.0.0.1:1357"
+
+[cache]
+dir = "./cache"
+max_versions = 1
+
+[update]
+enabled = false
+interval_minutes = 10
+
+[installer]
+enabled = true
+tags = ["latest"]
+platforms = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-pc-windows-msvc",
+  "x86_64-pc-windows-msvc"
+]
+'@ | Set-Content -Path config.ci.toml -Encoding utf8
+
+          $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--config","config.ci.toml" -PassThru
+          $proc.Id | Set-Content mirror.pid
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              Invoke-RestMethod "http://127.0.0.1:1357/api/installer/info" | Out-Null
+              break
+            } catch {
+              Start-Sleep -Seconds 1
+            }
+          }
 
       - name: Unix install tests
         if: startsWith(matrix.os, 'macos')
@@ -46,6 +162,23 @@ jobs:
         run: |
           .github/scripts/e2e-install-windows.ps1
 
+      - name: Stop mirror (macOS)
+        if: always() && startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          if [[ -f mirror.pid ]]; then
+            kill "$(cat mirror.pid)" || true
+          fi
+
+      - name: Stop mirror (Windows)
+        if: always() && startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          if (Test-Path mirror.pid) {
+            $pid = Get-Content mirror.pid
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+          }
+
   test-linux-containers:
     runs-on: ubuntu-latest
     strategy:
@@ -55,11 +188,11 @@ jobs:
           - name: linux-x64-glibc
             platform: linux/amd64
             image: ubuntu:24.04
-            install_deps: apt-get update && apt-get install -y curl ca-certificates bash python3 xz-utils
+            install_deps: DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get update && DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get install -y curl ca-certificates bash python3 xz-utils
           - name: linux-arm64-glibc
             platform: linux/arm64
             image: ubuntu:24.04
-            install_deps: apt-get update && apt-get install -y curl ca-certificates bash python3 xz-utils
+            install_deps: DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get update && DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get install -y curl ca-certificates bash python3 xz-utils
           - name: linux-x64-musl
             platform: linux/amd64
             image: alpine:3.19
@@ -69,19 +202,80 @@ jobs:
             image: alpine:3.19
             install_deps: apk add --no-cache bash curl ca-certificates python3
     env:
-      MIRROR_URL: http://${{ secrets.PUBLIC_URL }}:1357
+      MIRROR_URL: http://127.0.0.1:1357
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      - name: Prepare mirror (host)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --json tagName -q .tagName)"
+          version="${tag#v}"
+          tmp="$(mktemp -d)"
+          gh release download "$tag" -p "duckcoding-cli-installer-*" -D "$tmp"
+          gh release download "$tag" -p "duckcoding-cli-mirror-x86_64-unknown-linux-gnu.tar.xz" -D "$tmp"
+          python3 .github/scripts/prepare-installer-cache.py --assets-dir "$tmp" --cache-dir ./cache --version "$version"
+          tar -xJf "$tmp/duckcoding-cli-mirror-x86_64-unknown-linux-gnu.tar.xz"
+          chmod +x duckcoding-cli-mirror
+
+          cat > config.ci.toml <<'EOF'
+[server]
+host = "127.0.0.1"
+port = 1357
+public_url = "http://127.0.0.1:1357"
+
+[cache]
+dir = "./cache"
+max_versions = 1
+
+[update]
+enabled = false
+interval_minutes = 10
+
+[installer]
+enabled = true
+tags = ["latest"]
+platforms = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-pc-windows-msvc",
+  "x86_64-pc-windows-msvc"
+]
+EOF
+
+          ./duckcoding-cli-mirror --config config.ci.toml &
+          echo $! > mirror.pid
+          for _ in {1..30}; do
+            if curl -fsS http://127.0.0.1:1357/api/installer/info >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
       - name: Run install tests in container
         run: |
           docker run --rm \
+            --network host \
             --platform ${{ matrix.platform }} \
-            -e MIRROR_URL="${MIRROR_URL}" \
+            -e MIRROR_URL="http://127.0.0.1:1357" \
             -v "${PWD}:/work" \
             -w /work \
             ${{ matrix.image }} \
             /bin/sh -c "${{ matrix.install_deps }} && bash /work/.github/scripts/e2e-install-unix.sh"
+
+      - name: Stop mirror (host)
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f mirror.pid ]]; then
+            kill "$(cat mirror.pid)" || true
+          fi
