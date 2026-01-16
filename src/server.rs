@@ -1126,16 +1126,38 @@ fn provider_checksums_json(provider: &ProviderMetadata) -> serde_json::Value {
     serde_json::Value::Object(checksums)
 }
 
+fn inject_mirror_url_sh(script: &str, mirror_url: &str) -> String {
+    let marker = r#"MIRROR_URL="${MIRROR_URL:-__MIRROR_URL__}""#;
+    if script.contains(marker) {
+        script.replacen(
+            marker,
+            &format!(r#"MIRROR_URL="${{MIRROR_URL:-{}}}""#, mirror_url),
+            1,
+        )
+    } else {
+        script.to_string()
+    }
+}
+
+fn inject_mirror_url_ps1(script: &str, mirror_url: &str) -> String {
+    let marker = r#"$MirrorUrl = "__MIRROR_URL__""#;
+    if script.contains(marker) {
+        script.replacen(marker, &format!(r#"$MirrorUrl = "{}""#, mirror_url), 1)
+    } else {
+        script.to_string()
+    }
+}
+
 // Generate install.sh script
 fn generate_install_sh(mirror_url: &str) -> String {
     const SCRIPT: &str = include_str!("../scripts/claude-code-install.sh");
-    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+    inject_mirror_url_sh(SCRIPT, mirror_url)
 }
 
 // Generate install.ps1 script
 fn generate_install_ps1(mirror_url: &str) -> String {
     const SCRIPT: &str = include_str!("../scripts/claude-code-install.ps1");
-    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+    inject_mirror_url_ps1(SCRIPT, mirror_url)
 }
 
 // Generate uninstall.sh script
@@ -1150,12 +1172,12 @@ fn generate_uninstall_ps1() -> String {
 
 fn generate_codex_install_sh(mirror_url: &str) -> String {
     const SCRIPT: &str = include_str!("../scripts/codex-install.sh");
-    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+    inject_mirror_url_sh(SCRIPT, mirror_url)
 }
 
 fn generate_codex_install_ps1(mirror_url: &str) -> String {
     const SCRIPT: &str = include_str!("../scripts/codex-install.ps1");
-    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+    inject_mirror_url_ps1(SCRIPT, mirror_url)
 }
 
 fn generate_codex_uninstall_sh() -> String {
@@ -1168,12 +1190,12 @@ fn generate_codex_uninstall_ps1() -> String {
 
 fn generate_gemini_install_sh(mirror_url: &str) -> String {
     const SCRIPT: &str = include_str!("../scripts/gemini-install.sh");
-    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+    inject_mirror_url_sh(SCRIPT, mirror_url)
 }
 
 fn generate_gemini_install_ps1(mirror_url: &str) -> String {
     const SCRIPT: &str = include_str!("../scripts/gemini-install.ps1");
-    SCRIPT.replace("__MIRROR_URL__", mirror_url)
+    inject_mirror_url_ps1(SCRIPT, mirror_url)
 }
 
 fn generate_gemini_uninstall_sh() -> String {
