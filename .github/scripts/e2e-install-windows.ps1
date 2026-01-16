@@ -47,6 +47,9 @@ function Run-Cli {
     Invoke-TuiCheck $Bin
 
     Write-Host "==> Uninstalling $Name"
+    $procName = [IO.Path]::GetFileNameWithoutExtension($Bin)
+    Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 1
     Invoke-WebRequest -Uri "$env:MIRROR_URL/$Name/uninstall.ps1" -UseBasicParsing | Out-Null
     $uninstallScript = Join-Path $RepoRoot ("scripts\" + $Name + "-uninstall.ps1")
     & $uninstallScript @UninstallArgs
