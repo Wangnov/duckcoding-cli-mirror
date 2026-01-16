@@ -200,7 +200,7 @@ jobs:
           ) -join "`n"
           $config | Set-Content -Path config.ci.toml -Encoding utf8
 
-          $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--config","config.ci.toml" -PassThru -RedirectStandardOutput mirror.log -RedirectStandardError mirror.log
+          $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--config","config.ci.toml" -PassThru -RedirectStandardOutput mirror.out.log -RedirectStandardError mirror.err.log
           $proc.Id | Set-Content mirror.pid
           $ready = $false
           for ($i = 0; $i -lt 120; $i++) {
@@ -211,7 +211,8 @@ jobs:
             } catch {
               if ($proc.HasExited) {
                 Write-Host "mirror process exited during startup"
-                if (Test-Path mirror.log) { Get-Content mirror.log }
+                if (Test-Path mirror.out.log) { Get-Content mirror.out.log }
+                if (Test-Path mirror.err.log) { Get-Content mirror.err.log }
                 throw
               }
               Start-Sleep -Seconds 1
@@ -219,7 +220,8 @@ jobs:
           }
           if (-not $ready) {
             Write-Host "mirror did not become ready in time"
-            if (Test-Path mirror.log) { Get-Content mirror.log }
+            if (Test-Path mirror.out.log) { Get-Content mirror.out.log }
+            if (Test-Path mirror.err.log) { Get-Content mirror.err.log }
             throw "mirror not ready"
           }
 
