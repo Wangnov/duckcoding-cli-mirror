@@ -53,7 +53,12 @@ jobs:
             *) echo "Unsupported arch: $arch" >&2; exit 1 ;;
           esac
           tar -xJf "$tmp/$mirror_asset"
-          chmod +x duckcoding-cli-mirror
+          mirror_bin="$(find . -maxdepth 2 -type f -name duckcoding-cli-mirror -print -quit)"
+          if [[ -z "$mirror_bin" ]]; then
+            echo "duckcoding-cli-mirror binary not found after extraction" >&2
+            exit 1
+          fi
+          chmod +x "$mirror_bin"
 
           printf '%s\n' \
             '[server]' \
@@ -84,7 +89,7 @@ jobs:
             ']' \
             > config.ci.toml
 
-          ./duckcoding-cli-mirror --config config.ci.toml &
+          "$mirror_bin" --config config.ci.toml &
           echo $! > mirror.pid
           for _ in {1..30}; do
             if curl -fsS http://127.0.0.1:1357/api/installer/info >/dev/null; then
@@ -176,8 +181,8 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path mirror.pid) {
-            $pid = Get-Content mirror.pid
-            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            $mirrorPid = Get-Content mirror.pid
+            Stop-Process -Id $mirrorPid -Force -ErrorAction SilentlyContinue
           }
 
   test-linux-containers:
@@ -222,7 +227,12 @@ jobs:
           gh release download "$tag" -p "duckcoding-cli-mirror-x86_64-unknown-linux-gnu.tar.xz" -D "$tmp"
           python3 .github/scripts/prepare-installer-cache.py --assets-dir "$tmp" --cache-dir ./cache --version "$version"
           tar -xJf "$tmp/duckcoding-cli-mirror-x86_64-unknown-linux-gnu.tar.xz"
-          chmod +x duckcoding-cli-mirror
+          mirror_bin="$(find . -maxdepth 2 -type f -name duckcoding-cli-mirror -print -quit)"
+          if [[ -z "$mirror_bin" ]]; then
+            echo "duckcoding-cli-mirror binary not found after extraction" >&2
+            exit 1
+          fi
+          chmod +x "$mirror_bin"
 
           printf '%s\n' \
             '[server]' \
@@ -253,7 +263,7 @@ jobs:
             ']' \
             > config.ci.toml
 
-          ./duckcoding-cli-mirror --config config.ci.toml &
+          "$mirror_bin" --config config.ci.toml &
           echo $! > mirror.pid
           for _ in {1..30}; do
             if curl -fsS http://127.0.0.1:1357/api/installer/info >/dev/null; then

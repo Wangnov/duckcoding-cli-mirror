@@ -11,7 +11,7 @@ $BinDir = "$InstallDir\bin"
 function Invoke-RemoteScript {
     param(
         [Parameter(Mandatory=$true)][string]$Url,
-        [hashtable]$ScriptArgs = @{}
+        [string[]]$ScriptArgs = @()
     )
 
     $tmp = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName() + ".ps1")
@@ -43,11 +43,11 @@ function Run-Cli {
     param(
         [Parameter(Mandatory=$true)][string]$Name,
         [Parameter(Mandatory=$true)][string]$Bin,
-        [hashtable]$UninstallArgs = @{}
+        [string[]]$UninstallArgs = @()
     )
 
     Write-Host "==> Installing $Name"
-    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @{ NoModifyPath = $true }
+    Invoke-RemoteScript -Url "$env:MIRROR_URL/$Name/install.ps1" -ScriptArgs @("--no-modify-path")
 
     Write-Host "==> Version check: $Bin"
     & $Bin --version
@@ -65,4 +65,4 @@ function Run-Cli {
 
 Run-Cli -Name "claude-code" -Bin "$BinDir\claude.exe"
 Run-Cli -Name "codex" -Bin "$BinDir\codex.exe"
-Run-Cli -Name "gemini" -Bin "$BinDir\gemini.cmd" -UninstallArgs @{ Yes = $true }
+Run-Cli -Name "gemini" -Bin "$BinDir\gemini.cmd" -UninstallArgs @("-Yes")
