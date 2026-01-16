@@ -64,3 +64,15 @@ publish = false
 [profile.dist]
 inherits = "release"
 lto = "thin"
+strip = "symbols"
+
+[profile.release]
+strip = "symbols"
+
+[profile.release.package.duckcoding-cli-installer]
+opt-level = "z"
+codegen-units = 1
+
+[profile.dist.package.duckcoding-cli-installer]
+opt-level = "z"
+codegen-units = 1
