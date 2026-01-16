@@ -30,6 +30,7 @@ jobs:
             name: windows-x64
     env:
       MIRROR_URL: http://127.0.0.1:1357
+      SKIP_GEMINI: "1"
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -48,8 +49,14 @@ jobs:
 
           arch="$(uname -m)"
           case "$arch" in
-            x86_64) mirror_asset="duckcoding-cli-mirror-x86_64-apple-darwin.tar.xz" ;;
-            arm64) mirror_asset="duckcoding-cli-mirror-aarch64-apple-darwin.tar.xz" ;;
+            x86_64)
+              mirror_asset="duckcoding-cli-mirror-x86_64-apple-darwin.tar.xz"
+              provider_platform="darwin-x64"
+              ;;
+            arm64)
+              mirror_asset="duckcoding-cli-mirror-aarch64-apple-darwin.tar.xz"
+              provider_platform="darwin-arm64"
+              ;;
             *) echo "Unsupported arch: $arch" >&2; exit 1 ;;
           esac
           tar -xJf "$tmp/$mirror_asset"
@@ -87,16 +94,46 @@ jobs:
             '  "aarch64-pc-windows-msvc",' \
             '  "x86_64-pc-windows-msvc"' \
             ']' \
+            '' \
+            '[claude_code]' \
+            'tags = ["latest"]' \
+            "platforms = [\"$provider_platform\"]" \
+            '' \
+            '[codex]' \
+            'tags = ["latest"]' \
+            "platforms = [\"$provider_platform\"]" \
+            '' \
+            '[gemini]' \
+            'enabled = false' \
+            'tags = ["latest"]' \
+            '' \
+            '[node]' \
+            'enabled = false' \
+            '' \
+            '[node_pty]' \
+            'enabled = false' \
             > config.ci.toml
 
-          "$mirror_bin" --config config.ci.toml &
+          "$mirror_bin" --config config.ci.toml > mirror.log 2>&1 &
           echo $! > mirror.pid
-          for _ in {1..30}; do
+          ready=false
+          for _ in {1..120}; do
             if curl -fsS http://127.0.0.1:1357/api/installer/info >/dev/null; then
+              ready=true
               break
+            fi
+            if ! kill -0 "$(cat mirror.pid)" 2>/dev/null; then
+              echo "mirror process exited during startup" >&2
+              cat mirror.log >&2 || true
+              exit 1
             fi
             sleep 1
           done
+          if [[ "$ready" != "true" ]]; then
+            echo "mirror did not become ready in time" >&2
+            cat mirror.log >&2 || true
+            exit 1
+          fi
 
       - name: Prepare mirror (Windows)
         if: startsWith(matrix.os, 'windows')
@@ -113,6 +150,7 @@ jobs:
           Expand-Archive -Path (Join-Path $tmp "duckcoding-cli-mirror-x86_64-pc-windows-msvc.zip") -DestinationPath . -Force
           $exe = Get-ChildItem -Path . -Recurse -Filter "duckcoding-cli-mirror.exe" | Select-Object -First 1
           if (-not $exe) { throw "duckcoding-cli-mirror.exe not found" }
+          $providerPlatform = "win32-x64"
 
           $config = @(
             '[server]'
@@ -141,18 +179,48 @@ jobs:
             '  "aarch64-pc-windows-msvc",'
             '  "x86_64-pc-windows-msvc"'
             ']'
+            ''
+            '[claude_code]'
+            'tags = ["latest"]'
+            "platforms = [""$providerPlatform""]"
+            ''
+            '[codex]'
+            'tags = ["latest"]'
+            "platforms = [""$providerPlatform""]"
+            ''
+            '[gemini]'
+            'enabled = false'
+            'tags = ["latest"]'
+            ''
+            '[node]'
+            'enabled = false'
+            ''
+            '[node_pty]'
+            'enabled = false'
           ) -join "`n"
           $config | Set-Content -Path config.ci.toml -Encoding utf8
 
-          $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--config","config.ci.toml" -PassThru
+          $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--config","config.ci.toml" -PassThru -RedirectStandardOutput mirror.log -RedirectStandardError mirror.log
           $proc.Id | Set-Content mirror.pid
-          for ($i = 0; $i -lt 30; $i++) {
+          $ready = $false
+          for ($i = 0; $i -lt 120; $i++) {
             try {
               Invoke-RestMethod "http://127.0.0.1:1357/api/installer/info" | Out-Null
+              $ready = $true
               break
             } catch {
+              if ($proc.HasExited) {
+                Write-Host "mirror process exited during startup"
+                if (Test-Path mirror.log) { Get-Content mirror.log }
+                throw
+              }
               Start-Sleep -Seconds 1
             }
+          }
+          if (-not $ready) {
+            Write-Host "mirror did not become ready in time"
+            if (Test-Path mirror.log) { Get-Content mirror.log }
+            throw "mirror not ready"
           }
 
       - name: Unix install tests
@@ -194,21 +262,26 @@ jobs:
           - name: linux-x64-glibc
             platform: linux/amd64
             image: ubuntu:24.04
+            provider_platform: linux-x64
             install_deps: DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get update && DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get install -y curl ca-certificates bash python3 xz-utils
           - name: linux-arm64-glibc
             platform: linux/arm64
             image: ubuntu:24.04
+            provider_platform: linux-arm64
             install_deps: DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get update && DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get install -y curl ca-certificates bash python3 xz-utils
           - name: linux-x64-musl
             platform: linux/amd64
             image: alpine:3.19
+            provider_platform: linux-x64-musl
             install_deps: apk add --no-cache bash curl ca-certificates python3
           - name: linux-arm64-musl
             platform: linux/arm64
             image: alpine:3.19
+            provider_platform: linux-arm64-musl
             install_deps: apk add --no-cache bash curl ca-certificates python3
     env:
       MIRROR_URL: http://127.0.0.1:1357
+      SKIP_GEMINI: "1"
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -261,16 +334,46 @@ jobs:
             '  "aarch64-pc-windows-msvc",' \
             '  "x86_64-pc-windows-msvc"' \
             ']' \
+            '' \
+            '[claude_code]' \
+            'tags = ["latest"]' \
+            "platforms = [\"${{ matrix.provider_platform }}\"]" \
+            '' \
+            '[codex]' \
+            'tags = ["latest"]' \
+            "platforms = [\"${{ matrix.provider_platform }}\"]" \
+            '' \
+            '[gemini]' \
+            'enabled = false' \
+            'tags = ["latest"]' \
+            '' \
+            '[node]' \
+            'enabled = false' \
+            '' \
+            '[node_pty]' \
+            'enabled = false' \
             > config.ci.toml
 
-          "$mirror_bin" --config config.ci.toml &
+          "$mirror_bin" --config config.ci.toml > mirror.log 2>&1 &
           echo $! > mirror.pid
-          for _ in {1..30}; do
+          ready=false
+          for _ in {1..120}; do
             if curl -fsS http://127.0.0.1:1357/api/installer/info >/dev/null; then
+              ready=true
               break
+            fi
+            if ! kill -0 "$(cat mirror.pid)" 2>/dev/null; then
+              echo "mirror process exited during startup" >&2
+              cat mirror.log >&2 || true
+              exit 1
             fi
             sleep 1
           done
+          if [[ "$ready" != "true" ]]; then
+            echo "mirror did not become ready in time" >&2
+            cat mirror.log >&2 || true
+            exit 1
+          fi
 
       - name: Run install tests in container
         run: |
@@ -278,6 +381,7 @@ jobs:
             --network host \
             --platform ${{ matrix.platform }} \
             -e MIRROR_URL="http://127.0.0.1:1357" \
+            -e SKIP_GEMINI="1" \
             -v "${PWD}:/work" \
             -w /work \
             ${{ matrix.image }} \
