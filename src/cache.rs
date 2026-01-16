@@ -194,6 +194,10 @@ impl CacheManager {
 
     /// Clean up old versions, keeping only max_versions
     pub async fn cleanup_old_versions(&self, provider: &str) -> Result<usize> {
+        if provider == "installer" {
+            return self.cleanup_installer_latest().await;
+        }
+
         let max_versions = self.config.max_versions;
 
         let versions_to_remove = {
@@ -269,6 +273,62 @@ impl CacheManager {
                     _ => return Ok(0),
                 };
 
+                for version in &deleted_versions {
+                    provider_metadata.versions.remove(version);
+                }
+
+                serde_json::to_string_pretty(&*metadata)?
+            };
+
+            let metadata_path = self.config.dir.join("metadata.json");
+            tokio::fs::write(&metadata_path, content).await?;
+        }
+
+        Ok(deleted_versions.len())
+    }
+
+    async fn cleanup_installer_latest(&self) -> Result<usize> {
+        let versions_to_remove = {
+            let metadata = self.metadata.read().await;
+            let Some(latest) = metadata.installer.tags.get("latest") else {
+                tracing::warn!("Installer latest tag not set; skip cleanup");
+                return Ok(0);
+            };
+
+            metadata
+                .installer
+                .versions
+                .keys()
+                .filter(|version| *version != latest)
+                .cloned()
+                .collect::<Vec<String>>()
+        };
+
+        if versions_to_remove.is_empty() {
+            return Ok(0);
+        }
+
+        let mut deleted_versions = Vec::new();
+        for version in &versions_to_remove {
+            let version_path = self.version_path("installer", version);
+            if version_path.exists() {
+                if let Err(e) = tokio::fs::remove_dir_all(&version_path).await {
+                    tracing::warn!(
+                        "Failed to delete version directory {}: {}",
+                        version_path.display(),
+                        e
+                    );
+                } else {
+                    deleted_versions.push(version.clone());
+                    tracing::info!("Deleted old version: installer/{}", version);
+                }
+            }
+        }
+
+        if !deleted_versions.is_empty() {
+            let content = {
+                let mut metadata = self.metadata.write().await;
+                let provider_metadata = &mut metadata.installer;
                 for version in &deleted_versions {
                     provider_metadata.versions.remove(version);
                 }
