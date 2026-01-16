@@ -104,7 +104,11 @@ run_cli() {
 }
 
 run_cli "claude-code" "claude"
-run_cli "codex" "codex"
+if [[ "${SKIP_CODEX:-}" == "1" ]]; then
+  echo "Skipping codex: SKIP_CODEX=1"
+else
+  run_cli "codex" "codex"
+fi
 if [[ "${SKIP_GEMINI:-}" == "1" ]]; then
   echo "Skipping gemini: SKIP_GEMINI=1"
 elif is_musl; then
