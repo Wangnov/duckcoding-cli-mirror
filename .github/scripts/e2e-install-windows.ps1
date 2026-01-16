@@ -51,6 +51,10 @@ function Run-Cli {
     $uninstallScript = Join-Path $RepoRoot ("scripts\" + $Name + "-uninstall.ps1")
     & $uninstallScript @UninstallArgs
 
+    for ($i = 0; $i -lt 5; $i++) {
+        if (-not (Test-Path $Bin)) { break }
+        Start-Sleep -Seconds 1
+    }
     if (Test-Path $Bin) {
         throw "Uninstall check failed: $Bin still exists"
     }
