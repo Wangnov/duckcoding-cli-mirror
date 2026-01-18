@@ -199,7 +199,6 @@ impl ClaudeCodeProvider {
 
         let upload = oss::upload_stream(
             &self.storage.oss,
-            &self.client,
             object_key,
             "application/octet-stream",
             response.bytes_stream(),
@@ -323,7 +322,6 @@ impl ClaudeCodeProvider {
                     .ok_or_else(|| MirrorError::Provider("Invalid manifest key".to_string()))?;
                 oss::put_bytes(
                     &self.storage.oss,
-                    &self.client,
                     &key,
                     "application/json",
                     manifest_json.into_bytes(),
@@ -393,12 +391,7 @@ impl ClaudeCodeProvider {
                                         "Checksum verification failed for {}/{}: expected {}, got {}",
                                         version, task.platform, task.checksum, result.sha256
                                     );
-                                    let _ = oss::delete_object(
-                                        &provider.storage.oss,
-                                        &provider.client,
-                                        &key,
-                                    )
-                                    .await;
+                                    let _ = oss::delete_object(&provider.storage.oss, &key).await;
                                     return Err(format!("Checksum mismatch for {}", task.platform));
                                 }
 
@@ -599,7 +592,7 @@ impl ClaudeCodeProvider {
                 }
             }
             for key in keys {
-                if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await {
+                if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
                     warn!("Failed to delete OSS object {}: {}", key, e);
                 }
             }

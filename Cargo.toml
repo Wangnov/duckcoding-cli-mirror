@@ -49,6 +49,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 # 命令行参数
 clap = { version = "4", features = ["derive"] }
+aliyun-oss-client = "0.12.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,15 +1,15 @@
+use aliyun_oss_client::file::Files;
+use aliyun_oss_client::{BucketName, Client as OssClient, EndPoint, ObjectPath};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
-use reqwest::{Client, StatusCode, header};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio_util::io::ReaderStream;
 
 use crate::config::OssConfig;
 
@@ -19,62 +19,33 @@ pub fn presign_get_url(config: &OssConfig, object_key: &str) -> Result<String> {
     presign_url(config, "GET", object_key, None)
 }
 
-pub fn presign_put_url(config: &OssConfig, object_key: &str, content_type: &str) -> Result<String> {
-    presign_url(config, "PUT", object_key, Some(content_type))
-}
-
-pub fn presign_delete_url(config: &OssConfig, object_key: &str) -> Result<String> {
-    presign_url(config, "DELETE", object_key, None)
-}
-
 pub async fn put_bytes(
     config: &OssConfig,
-    client: &Client,
     object_key: &str,
     content_type: &str,
     body: Vec<u8>,
 ) -> Result<()> {
-    let url = presign_put_url(config, object_key, content_type)?;
-    let response = client
-        .put(url)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(body)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to upload object {}: {}",
-            object_key,
-            response.status()
-        ));
-    }
+    let client = oss_client(config)?;
+    let path = object_path(config, object_key)?;
+    client
+        .put_content_base(body, content_type, path)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to upload object {}: {}", object_key, err))?;
     Ok(())
 }
 
-pub async fn get_object_bytes(
-    config: &OssConfig,
-    client: &Client,
-    object_key: &str,
-) -> Result<Bytes> {
-    let url = presign_get_url(config, object_key)?;
-    let response = client.get(url).send().await?;
-    if response.status() == StatusCode::NOT_FOUND {
-        return Err(anyhow::anyhow!("OSS object not found: {}", object_key));
-    }
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to fetch object {}: {}",
-            object_key,
-            response.status()
-        ));
-    }
-    Ok(response.bytes().await?)
+pub async fn get_object_bytes(config: &OssConfig, object_key: &str) -> Result<Bytes> {
+    let client = oss_client(config)?;
+    let path = object_path(config, object_key)?;
+    let content = client
+        .get_object(path, ..)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to fetch object {}: {}", object_key, err))?;
+    Ok(Bytes::from(content))
 }
 
 pub async fn upload_stream<S>(
     config: &OssConfig,
-    client: &Client,
     object_key: &str,
     content_type: &str,
     stream: S,
@@ -114,16 +85,7 @@ where
 
     drop(file);
 
-    let upload_result = match upload_file(
-        config,
-        client,
-        object_key,
-        content_type,
-        &temp_path,
-        upload_result.size,
-    )
-    .await
-    {
+    let upload_result = match upload_file(config, object_key, content_type, &temp_path).await {
         Ok(()) => upload_result,
         Err(err) => {
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -135,49 +97,29 @@ where
     Ok(upload_result)
 }
 
-pub async fn delete_object(config: &OssConfig, client: &Client, object_key: &str) -> Result<()> {
-    let url = presign_delete_url(config, object_key)?;
-    let response = client.delete(url).send().await?;
-    if response.status() == StatusCode::NOT_FOUND {
-        return Ok(());
-    }
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to delete object {}: {}",
-            object_key,
-            response.status()
-        ));
-    }
+pub async fn delete_object(config: &OssConfig, object_key: &str) -> Result<()> {
+    let client = oss_client(config)?;
+    let path = object_path(config, object_key)?;
+    client
+        .delete_object(path)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to delete object {}: {}", object_key, err))?;
     Ok(())
 }
 
 pub async fn upload_file(
     config: &OssConfig,
-    client: &Client,
     object_key: &str,
     content_type: &str,
-    path: &Path,
-    size: u64,
+    path: &PathBuf,
 ) -> Result<()> {
-    let url = presign_put_url(config, object_key, content_type)?;
-    let file = tokio::fs::File::open(path).await?;
-    let stream = ReaderStream::new(file);
-    let response = client
-        .put(url)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, size.to_string())
-        .body(reqwest::Body::wrap_stream(stream))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to upload object {}: {}",
-            object_key,
-            response.status()
-        ));
-    }
-
+    let client = oss_client(config)?;
+    let path_key = object_path(config, object_key)?;
+    let content = tokio::fs::read(path).await?;
+    client
+        .put_content_base(content, content_type, path_key)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to upload object {}: {}", object_key, err))?;
     Ok(())
 }
 
@@ -216,6 +158,52 @@ fn temp_path_for(object_key: &str) -> Result<PathBuf> {
         .context("Failed to get time for temp path")?
         .as_nanos();
     Ok(std::env::temp_dir().join(format!("dc-mirror-{}-{}.tmp", name, ts)))
+}
+
+fn object_path(config: &OssConfig, object_key: &str) -> Result<ObjectPath> {
+    let key = join_prefix(&config.prefix, object_key);
+    let path = key
+        .parse::<ObjectPath>()
+        .map_err(|err| anyhow::anyhow!("Invalid OSS object path {}: {}", key, err))?;
+    Ok(path)
+}
+
+fn oss_client(config: &OssConfig) -> Result<OssClient> {
+    validate_config(config)?;
+    let bucket: BucketName = config
+        .bucket
+        .parse()
+        .map_err(|err| anyhow::anyhow!("Invalid OSS bucket {}: {}", config.bucket, err))?;
+    let endpoint = parse_endpoint(config)?;
+    Ok(OssClient::new(
+        config.access_key_id.clone().into(),
+        config.access_key_secret.clone().into(),
+        endpoint,
+        bucket,
+    ))
+}
+
+fn parse_endpoint(config: &OssConfig) -> Result<EndPoint> {
+    let endpoint = config.endpoint.trim();
+    let endpoint = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else if endpoint.contains('.') {
+        let scheme = if config.https { "https" } else { "http" };
+        format!("{scheme}://{endpoint}")
+    } else {
+        endpoint.to_string()
+    };
+
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        let url = endpoint
+            .parse::<reqwest::Url>()
+            .context("Failed to parse OSS endpoint URL")?;
+        return EndPoint::try_from(url)
+            .map_err(|err| anyhow::anyhow!("Invalid OSS endpoint {}: {}", config.endpoint, err));
+    }
+
+    EndPoint::try_from(endpoint.as_str())
+        .map_err(|err| anyhow::anyhow!("Invalid OSS endpoint {}: {}", config.endpoint, err))
 }
 
 fn encode_object_key(key: &str) -> String {

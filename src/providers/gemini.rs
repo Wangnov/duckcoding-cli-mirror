@@ -191,7 +191,6 @@ impl GeminiProvider {
 
         let upload = oss::upload_stream(
             &self.storage.oss,
-            &self.client,
             object_key,
             "application/octet-stream",
             response.bytes_stream(),
@@ -327,7 +326,7 @@ impl GeminiProvider {
                         "Checksum verification failed for {}: expected {}, got {}",
                         version, expected, result.sha256
                     );
-                    let _ = oss::delete_object(&self.storage.oss, &self.client, &key).await;
+                    let _ = oss::delete_object(&self.storage.oss, &key).await;
                     return Err(MirrorError::ChecksumMismatch {
                         expected: expected.to_string(),
                         actual: result.sha256,
@@ -494,8 +493,7 @@ impl GeminiProvider {
                     PROVIDER_NAME,
                     &["versions", version, platform, &meta.filename],
                 ) {
-                    if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await
-                    {
+                    if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
                         warn!("Failed to delete OSS object {}: {}", key, e);
                     }
                 }

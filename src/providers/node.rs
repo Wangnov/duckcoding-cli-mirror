@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
@@ -35,22 +33,14 @@ struct ChecksumsEntry {
 pub struct NodeProvider {
     config: NodeConfig,
     cache: Arc<CacheManager>,
-    client: Client,
     storage: StorageConfig,
 }
 
 impl NodeProvider {
     pub fn new(config: NodeConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
-        let client = Client::builder()
-            .user_agent("duckcoding-cli-mirror/0.1.0")
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("Failed to create HTTP client");
         Self {
             config,
             cache,
-            client,
             storage,
         }
     }
@@ -74,7 +64,7 @@ impl NodeProvider {
                     .cache
                     .build_object_key(PROVIDER_NAME, &["versions", version, "checksums.json"])
                     .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
-                let content = oss::get_object_bytes(&self.storage.oss, &self.client, &key).await?;
+                let content = oss::get_object_bytes(&self.storage.oss, &key).await?;
                 Ok(serde_json::from_slice(&content)?)
             }
         }
@@ -259,7 +249,7 @@ impl NodeProvider {
                 }
             }
             for key in keys {
-                if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await {
+                if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
                     warn!("Failed to delete OSS object {}: {}", key, e);
                 }
             }
