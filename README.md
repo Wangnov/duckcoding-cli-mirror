@@ -96,6 +96,63 @@ cargo build --release
 ./target/release/duckcoding-cli-mirror --config config.toml
 ```
 
+### 服务端部署与缓存准备（不主动拉取 GitHub）
+
+为避免服务端向 GitHub 发起下载请求，以下三类缓存需要在部署时由运维**从本地/CI 拉取**并同步到服务器：
+
+- **installer**：由 release 构建产生（cargo-dist）
+- **node**：由 `node-runtime.yml` 构建产生
+- **node-pty**：由 `node-pty-prebuilds.yml` 构建产生
+
+建议流程（在本地执行，服务器仅接收 rsync）：
+
+1) 触发 CI 并下载产物（示例）：
+
+```bash
+# node runtime
+gh run list -w node-runtime.yml -L 1
+gh run download <RUN_ID> -D /tmp/node-runtime
+
+# node-pty
+gh run list -w node-pty-prebuilds.yml -L 1
+gh run download <RUN_ID> -D /tmp/node-pty
+
+# installer：从 GitHub Release 下载对应版本资产
+gh release download <TAG> -D /tmp/installer
+```
+
+2) 同步到服务器 cache（示例）：
+
+```bash
+# node
+rsync -av /tmp/node-runtime/node-<VERSION>-runtime/ \
+  <USER>@<SERVER>:/home/<USER>/duckcoding-cli-mirror/cache/node/versions/<VERSION>/
+
+# node-pty
+rsync -av /tmp/node-pty/node-pty-<VERSION>-prebuilds/ \
+  <USER>@<SERVER>:/home/<USER>/duckcoding-cli-mirror/cache/node-pty/versions/<VERSION>/
+
+# installer
+rsync -av /tmp/installer/ \
+  <USER>@<SERVER>:/home/<USER>/duckcoding-cli-mirror/cache/installer/versions/<VERSION>/
+```
+
+3) 写入 tag 并刷新缓存：
+
+```bash
+ssh <USER>@<SERVER> <<'EOF'
+set -e
+echo "<NODE_VERSION>" > /home/<USER>/duckcoding-cli-mirror/cache/node/tags/latest
+echo "<NODE_PTY_VERSION>" > /home/<USER>/duckcoding-cli-mirror/cache/node-pty/tags/latest
+echo "<INSTALLER_VERSION>" > /home/<USER>/duckcoding-cli-mirror/cache/installer/tags/latest
+curl -fsS -X POST http://127.0.0.1:1357/api/node/refresh
+curl -fsS -X POST http://127.0.0.1:1357/api/node-pty/refresh
+curl -fsS -X POST http://127.0.0.1:1357/api/installer/refresh
+EOF
+```
+
+> 说明：服务端不会主动从 GitHub 拉取 installer/node/node-pty，部署时需保证这些缓存已被同步到 `cache/`。
+
 ### 配置文件
 
 复制示例配置并修改：

@@ -13,7 +13,30 @@ host = "0.0.0.0"
 # Cache settings
 [cache]
 dir = "./cache"
+# 设为 0 表示只保留 tag 引用的版本（例如 stable/latest）
 max_versions = 10
+
+# Storage settings (local or oss)
+[storage]
+# local 或 oss
+mode = "local"
+
+# OSS 配置（当 mode = "oss" 时生效）
+[storage.oss]
+# endpoint 例：oss-cn-hangzhou.aliyuncs.com
+endpoint = ""
+bucket = ""
+access_key_id = ""
+access_key_secret = ""
+# 可选：STS 临时凭证
+# security_token = ""
+# 可选：对象前缀，例如 "mirror"
+prefix = ""
+https = true
+# 是否使用 path-style（https://endpoint/bucket/key）
+path_style = false
+# 预签名链接过期时间（秒）
+expires_seconds = 900
 
 # Auto-update settings
 [update]
