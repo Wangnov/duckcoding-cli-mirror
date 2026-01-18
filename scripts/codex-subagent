@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+def project_root() -> Path:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if out:
+            return Path(out)
+    except Exception:
+        pass
+    return Path.cwd()
+
+
+def agent_dirs(root: Path) -> List[Path]:
+    env = os.environ.get("CODEX_SUBAGENT_DIRS")
+    if env:
+        dirs = [Path(p).expanduser() for p in env.split(os.pathsep) if p.strip()]
+    else:
+        dirs = [
+            root / ".codex" / "agents",
+            root / ".claude" / "agents",
+            Path.home() / ".claude" / "agents",
+        ]
+    return [d for d in dirs if d.exists()]
+
+
+def parse_frontmatter(path: Path) -> Tuple[Dict, str]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    front = {}
+    body = text
+    if lines and lines[0].strip() == "---":
+        end = None
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                end = i
+                break
+        if end is not None:
+            front_lines = lines[1:end]
+            body = "\n".join(lines[end + 1 :]).lstrip("\n")
+            for raw in front_lines:
+                line = raw.strip()
+                if not line or line.startswith("#") or ":" not in line:
+                    continue
+                key, val = line.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if (
+                    (val.startswith('"') and val.endswith('"'))
+                    or (val.startswith("'") and val.endswith("'"))
+                ):
+                    val = val[1:-1]
+                front[key] = val
+    for key in ("tools", "disallowedTools", "skills"):
+        if key in front:
+            front[key] = [x.strip() for x in front[key].split(",") if x.strip()]
+    return front, body
+
+
+def discover_agents(root: Path) -> Dict[str, Dict]:
+    agents: Dict[str, Dict] = {}
+    for directory in agent_dirs(root):
+        for path in sorted(directory.glob("*.md")):
+            front, body = parse_frontmatter(path)
+            name = front.get("name") or path.stem
+            if name in agents:
+                continue
+            agents[name] = {
+                "name": name,
+                "path": path,
+                "front": front,
+                "body": body,
+                "description": front.get("description", ""),
+            }
+    return agents
+
+
+def build_prompt(front: Dict, body: str, task: str) -> str:
+    parts = []
+    description = front.get("description", "").strip()
+    if description:
+        parts.append(f"Subagent description:\n{description}")
+
+    constraints = []
+    tools = front.get("tools") or []
+    disallowed = front.get("disallowedTools") or []
+    permission_mode = front.get("permissionMode", "").strip()
+    skills = front.get("skills") or []
+
+    if tools:
+        constraints.append("Allowed tools: " + ", ".join(tools))
+    if disallowed:
+        constraints.append("Disallowed tools: " + ", ".join(disallowed))
+    if permission_mode:
+        constraints.append("Permission mode: " + permission_mode)
+    if skills:
+        constraints.append("Skills (not auto-injected): " + ", ".join(skills))
+
+    if constraints:
+        constraints.append(
+            "Note: Tool restrictions are advisory in Codex exec; follow them strictly."
+        )
+        parts.append("Constraints:\n" + "\n".join(constraints))
+
+    body = body.strip()
+    if body:
+        parts.append(body)
+    task = task.strip()
+    if task:
+        parts.append("Task:\n" + task)
+    return "\n\n".join(parts).strip()
+
+
+def parse_task(args) -> str:
+    if args.task:
+        return args.task
+    if args.task_args:
+        return " ".join(args.task_args).strip()
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    return ""
+
+
+def ensure_run_dirs() -> Path:
+    base = Path.home() / ".codex" / "subagents"
+    (base / "logs").mkdir(parents=True, exist_ok=True)
+    (base / "runs").mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def codex_cmd_base(
+    root: Path, args, model: Optional[str], sandbox: Optional[str]
+) -> List[str]:
+    cmd = ["codex", "exec", "--cd", str(root)]
+    if model:
+        cmd += ["--model", model]
+    if args.full_auto:
+        cmd.append("--full-auto")
+    if args.bypass:
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    if sandbox:
+        cmd += ["--sandbox", sandbox]
+    for add_dir in args.add_dir or []:
+        cmd += ["--add-dir", add_dir]
+    for cfg in args.config or []:
+        cmd += ["-c", cfg]
+    return cmd
+
+
+def choose_sandbox(front: Dict, args) -> Optional[str]:
+    if args.sandbox:
+        return args.sandbox
+    permission_mode = (front.get("permissionMode") or "").strip()
+    if permission_mode == "plan":
+        return "read-only"
+    if permission_mode in ("default", "acceptEdits"):
+        return "workspace-write"
+    return None
+
+
+def warn_unsupported(front: dict):
+    if "hooks" in front:
+        print(
+            "WARN: hooks found in frontmatter but are not supported by codex-subagent.",
+            file=sys.stderr,
+        )
+
+
+def run_foreground(root: Path, agent: dict, args):
+    front = agent["front"]
+    warn_unsupported(front)
+    task = parse_task(args)
+    prompt = build_prompt(front, agent["body"], task)
+
+    model = front.get("model")
+    if model == "inherit":
+        model = None
+    sandbox = choose_sandbox(front, args)
+
+    cmd = codex_cmd_base(root, args, model, sandbox)
+    cmd.append(prompt if prompt else "-")
+
+    if not prompt and sys.stdin.isatty():
+        print("ERROR: empty prompt; provide --task or stdin.", file=sys.stderr)
+        sys.exit(2)
+
+    subprocess.run(cmd, check=False)
+
+
+def run_background(root: Path, agent: dict, args):
+    front = agent["front"]
+    warn_unsupported(front)
+    task = parse_task(args)
+    prompt = build_prompt(front, agent["body"], task)
+    if not prompt:
+        print("ERROR: empty prompt; provide --task or stdin.", file=sys.stderr)
+        sys.exit(2)
+
+    model = front.get("model")
+    if model == "inherit":
+        model = None
+    sandbox = choose_sandbox(front, args)
+
+    base = ensure_run_dirs()
+    run_id = f"{agent['name']}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    log_path = base / "logs" / f"{run_id}.log"
+    last_path = base / "runs" / f"{run_id}.last.txt"
+    meta_path = base / "runs" / f"{run_id}.json"
+
+    cmd = codex_cmd_base(root, args, model, sandbox)
+    cmd += ["--json", "--output-last-message", str(last_path), prompt]
+
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    meta = {
+        "run_id": run_id,
+        "agent": agent["name"],
+        "pid": proc.pid,
+        "log_path": str(log_path),
+        "last_message_path": str(last_path),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    print(json.dumps(meta, indent=2))
+
+
+def resume_session(args):
+    task = parse_task(args)
+    cmd = ["codex", "exec", "resume"]
+    if args.last:
+        cmd.append("--last")
+    if args.session_id:
+        cmd.append(args.session_id)
+    if args.model:
+        cmd += ["--model", args.model]
+    if args.full_auto:
+        cmd.append("--full-auto")
+    if args.bypass:
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    for cfg in args.config or []:
+        cmd += ["-c", cfg]
+    cmd.append(task if task else "-")
+
+    subprocess.run(cmd, check=False)
+
+
+def list_agents(root: Path):
+    agents = discover_agents(root)
+    if not agents:
+        print("No subagents found.")
+        return
+    for name in sorted(agents.keys()):
+        agent = agents[name]
+        desc = agent.get("description") or ""
+        path = agent["path"]
+        print(f"{name}\t{desc}\t{path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run Claude-style subagents via codex exec."
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    list_p = sub.add_parser("list", help="List available subagents")
+    list_p.set_defaults(func=lambda args: list_agents(project_root()))
+
+    run_p = sub.add_parser("run", help="Run a subagent (foreground or background)")
+    run_p.add_argument("agent", help="Subagent name")
+    run_p.add_argument("--task", help="Task prompt")
+    run_p.add_argument("--background", action="store_true", help="Run in background")
+    run_p.add_argument("--model", help="Override model")
+    run_p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
+    run_p.add_argument("--full-auto", action="store_true")
+    run_p.add_argument(
+        "--bypass",
+        action="store_true",
+        help="Use dangerously-bypass-approvals-and-sandbox",
+    )
+    run_p.add_argument("--add-dir", action="append")
+    run_p.add_argument("-c", "--config", action="append")
+    run_p.add_argument("task_args", nargs=argparse.REMAINDER)
+
+    resume_p = sub.add_parser("resume", help="Resume a codex exec session")
+    resume_p.add_argument("session_id", nargs="?", help="Session id (UUID)")
+    resume_p.add_argument("--last", action="store_true", help="Resume last session")
+    resume_p.add_argument("--task", help="Prompt to send after resuming")
+    resume_p.add_argument("--model", help="Override model")
+    resume_p.add_argument("--full-auto", action="store_true")
+    resume_p.add_argument(
+        "--bypass",
+        action="store_true",
+        help="Use dangerously-bypass-approvals-and-sandbox",
+    )
+    resume_p.add_argument("-c", "--config", action="append")
+    resume_p.add_argument("task_args", nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+
+    if args.cmd == "list":
+        args.func(args)
+        return
+    if args.cmd == "resume":
+        resume_session(args)
+        return
+
+    root = project_root()
+    agents = discover_agents(root)
+    if args.agent not in agents:
+        print(f"ERROR: subagent '{args.agent}' not found.", file=sys.stderr)
+        sys.exit(2)
+    agent = agents[args.agent]
+
+    if args.model:
+        agent["front"]["model"] = args.model
+
+    if args.background:
+        run_background(root, agent, args)
+    else:
+        run_foreground(root, agent, args)
+
+
+if __name__ == "__main__":
+    main()
