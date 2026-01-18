@@ -14,6 +14,8 @@ pub struct DownloadProgress {
     wave_pos: usize,
     wave_period: usize,
     spinner_idx: usize,
+    spinner_last: Instant,
+    spinner_interval: Duration,
     hidden_cursor: bool,
 }
 
@@ -25,6 +27,11 @@ impl DownloadProgress {
             Theme::Codex => display_width(&label).saturating_add(12).max(1),
             _ => 1,
         };
+        let spinner_interval = match theme {
+            Theme::Claude => Duration::from_millis(120),
+            Theme::Gemini => Duration::from_millis(120),
+            Theme::Codex => Duration::from_millis(80),
+        };
         Some(Self {
             theme,
             label,
@@ -35,6 +42,8 @@ impl DownloadProgress {
             wave_pos: 0,
             wave_period,
             spinner_idx: 0,
+            spinner_last: Instant::now(),
+            spinner_interval,
             hidden_cursor,
         })
     }
@@ -64,6 +73,12 @@ impl DownloadProgress {
 
         let size_str = format_size(downloaded);
         let speed_str = format_speed(self.speed);
+        let advance_spinner = now.duration_since(self.spinner_last) >= self.spinner_interval;
+        if advance_spinner {
+            self.spinner_idx = self.spinner_idx.wrapping_add(1);
+            self.spinner_last = now;
+        }
+
         let line = match self.theme {
             Theme::Codex => {
                 let style = self.theme.style();
@@ -93,7 +108,6 @@ impl DownloadProgress {
                 let style = self.theme.style();
                 let spinner = self.theme.progress_symbols().spinner;
                 let symbol = spinner[self.spinner_idx % spinner.len()];
-                self.spinner_idx = self.spinner_idx.wrapping_add(1);
                 let circle = self.theme.progress_circle(pct);
                 format!(
                     "  {primary}{symbol}{reset} {label} {dim}{circle} {pct:3}% | {size} | {speed}{reset}",
@@ -117,7 +131,6 @@ impl DownloadProgress {
                     .get(self.spinner_idx % colors.len().max(1))
                     .copied()
                     .unwrap_or(74);
-                self.spinner_idx = self.spinner_idx.wrapping_add(1);
                 format!(
                     "  \x1b[38;5;{color}m{symbol}{reset} {label} {dim}{pct:3}% | {size} | {speed}{reset}",
                     color = color,
