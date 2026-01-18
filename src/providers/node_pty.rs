@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, FileMetadata, PlatformMetadata, VersionMetadata};
-use crate::config::NodePtyConfig;
+use crate::config::{NodePtyConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
+use crate::oss;
 
 const PROVIDER_NAME: &str = "node-pty";
 const PRIMARY_FILE: &str = "pty.node";
@@ -34,11 +37,24 @@ struct ChecksumsEntry {
 pub struct NodePtyProvider {
     config: NodePtyConfig,
     cache: Arc<CacheManager>,
+    client: Client,
+    storage: StorageConfig,
 }
 
 impl NodePtyProvider {
-    pub fn new(config: NodePtyConfig, cache: Arc<CacheManager>) -> Self {
-        Self { config, cache }
+    pub fn new(config: NodePtyConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
+        let client = Client::builder()
+            .user_agent("duckcoding-cli-mirror/0.1.0")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("Failed to create HTTP client");
+        Self {
+            config,
+            cache,
+            client,
+            storage,
+        }
     }
 
     fn prebuild_path(&self, version: &str, platform: &str, filename: &str) -> PathBuf {
@@ -50,16 +66,28 @@ impl NodePtyProvider {
     }
 
     async fn read_checksums(&self, version: &str) -> Result<ChecksumsFile> {
-        let path = self
-            .cache
-            .get_file_path(PROVIDER_NAME, &["versions", version, "checksums.json"])
-            .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
+        match self.storage.mode {
+            StorageMode::Local => {
+                let path = self
+                    .cache
+                    .get_file_path(PROVIDER_NAME, &["versions", version, "checksums.json"])
+                    .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
 
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to read checksums.json for {}", version))?;
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("Failed to read checksums.json for {}", version))?;
 
-        Ok(serde_json::from_str(&content)?)
+                Ok(serde_json::from_str(&content)?)
+            }
+            StorageMode::Oss => {
+                let key = self
+                    .cache
+                    .build_object_key(PROVIDER_NAME, &["versions", version, "checksums.json"])
+                    .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
+                let content = oss::get_object_bytes(&self.storage.oss, &self.client, &key).await?;
+                Ok(serde_json::from_slice(&content)?)
+            }
+        }
     }
 
     async fn verify_file_size(path: &Path, expected: u64) -> Result<()> {
@@ -97,8 +125,11 @@ impl NodePtyProvider {
             .await?;
 
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
-        if deleted > 0 {
-            info!("Cleaned up {} old versions", deleted);
+        if !deleted.is_empty() {
+            info!("Cleaned up {} old versions", deleted.len());
+            if matches!(self.storage.mode, StorageMode::Oss) {
+                self.delete_oss_versions(&deleted).await;
+            }
         }
 
         Ok(Some(version))
@@ -132,15 +163,17 @@ impl NodePtyProvider {
             let mut files_meta = HashMap::new();
             for (filename, entry) in &platform_meta.files {
                 let path = self.prebuild_path(version, platform, filename);
-                if !path.exists() {
-                    return Err(MirrorError::Provider(format!(
-                        "Missing file for {}/{}: {}",
-                        version, platform, filename
-                    ))
-                    .into());
-                }
+                if matches!(self.storage.mode, StorageMode::Local) {
+                    if !path.exists() {
+                        return Err(MirrorError::Provider(format!(
+                            "Missing file for {}/{}: {}",
+                            version, platform, filename
+                        ))
+                        .into());
+                    }
 
-                Self::verify_file_size(&path, entry.size).await?;
+                    Self::verify_file_size(&path, entry.size).await?;
+                }
 
                 files_meta.insert(
                     filename.clone(),
@@ -198,22 +231,65 @@ impl NodePtyProvider {
             };
 
             if platform_meta.files.is_empty() {
-                let path = self.prebuild_path(version, platform, &platform_meta.filename);
-                if !path.exists() {
-                    return false;
+                if matches!(self.storage.mode, StorageMode::Local) {
+                    let path = self.prebuild_path(version, platform, &platform_meta.filename);
+                    if !path.exists() {
+                        return false;
+                    }
                 }
                 continue;
             }
 
             for filename in platform_meta.files.keys() {
-                let path = self.prebuild_path(version, platform, filename);
-                if !path.exists() {
-                    return false;
+                if matches!(self.storage.mode, StorageMode::Local) {
+                    let path = self.prebuild_path(version, platform, filename);
+                    if !path.exists() {
+                        return false;
+                    }
                 }
             }
         }
 
         true
+    }
+
+    async fn delete_oss_versions(&self, versions: &[VersionMetadata]) {
+        for version_meta in versions {
+            let version = &version_meta.version;
+            let mut keys = Vec::new();
+            if let Some(key) = self
+                .cache
+                .build_object_key(PROVIDER_NAME, &["versions", version, "checksums.json"])
+            {
+                keys.push(key);
+            }
+            for (platform, meta) in &version_meta.platforms {
+                if meta.files.is_empty() {
+                    if let Some(key) = self.cache.build_object_key(
+                        PROVIDER_NAME,
+                        &["versions", version, "prebuilds", platform, &meta.filename],
+                    ) {
+                        keys.push(key);
+                    }
+                    continue;
+                }
+
+                for filename in meta.files.keys() {
+                    if let Some(key) = self.cache.build_object_key(
+                        PROVIDER_NAME,
+                        &["versions", version, "prebuilds", platform, filename],
+                    ) {
+                        keys.push(key);
+                    }
+                }
+            }
+
+            for key in keys {
+                if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await {
+                    warn!("Failed to delete OSS object {}: {}", key, e);
+                }
+            }
+        }
     }
 
     pub async fn sync_all(&self) -> Result<Vec<String>> {

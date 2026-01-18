@@ -12,8 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
-use crate::config::CodexConfig;
+use crate::config::{CodexConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
+use crate::oss;
 use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
 
 const PROVIDER_NAME: &str = "codex";
@@ -45,10 +46,11 @@ pub struct CodexProvider {
     client: Client,
     cache: Arc<CacheManager>,
     github_token: Option<String>,
+    storage: StorageConfig,
 }
 
 impl CodexProvider {
-    pub fn new(config: CodexConfig, cache: Arc<CacheManager>) -> Self {
+    pub fn new(config: CodexConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
         let client = Client::builder()
             .user_agent("duckcoding-cli-mirror/0.1.0")
             .connect_timeout(Duration::from_secs(10))
@@ -63,6 +65,7 @@ impl CodexProvider {
             client,
             cache,
             github_token,
+            storage,
         }
     }
 
@@ -193,6 +196,36 @@ impl CodexProvider {
         })
     }
 
+    async fn download_asset_to_oss(&self, url: &str, object_key: &str) -> Result<DownloadResult> {
+        let url = url.to_string();
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
+            .await
+            .with_context(|| format!("Failed to download asset {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to download asset {}: {}",
+                url, status
+            ))
+            .into());
+        }
+
+        let upload = oss::upload_stream(
+            &self.storage.oss,
+            &self.client,
+            object_key,
+            "application/octet-stream",
+            response.bytes_stream(),
+        )
+        .await?;
+
+        Ok(DownloadResult {
+            size: upload.size,
+            sha256: upload.sha256,
+        })
+    }
+
     async fn verify_file_checksum(path: &Path, expected: &str) -> Result<u64> {
         let mut file = tokio::fs::File::open(path).await?;
         let mut hasher = Sha256::new();
@@ -263,8 +296,11 @@ impl CodexProvider {
             .await?;
 
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
-        if deleted > 0 {
-            info!("Cleaned up {} old versions", deleted);
+        if !deleted.is_empty() {
+            info!("Cleaned up {} old versions", deleted.len());
+            if matches!(self.storage.mode, StorageMode::Oss) {
+                self.delete_oss_versions(&deleted).await;
+            }
         }
 
         Ok(Some(upstream_version))
@@ -331,88 +367,137 @@ impl CodexProvider {
         let provider = self;
         let mut platforms_metadata = HashMap::new();
 
+        let oss_mode = matches!(provider.storage.mode, StorageMode::Oss);
         let mut stream = stream::iter(tasks)
             .map(|task| {
                 let version = version_label.clone();
                 async move {
-                let path = provider.cache.binary_path(
-                    PROVIDER_NAME,
-                    &version,
-                    &task.platform,
-                    &task.asset_name,
-                );
+                    if oss_mode {
+                        let key = provider
+                            .cache
+                            .build_object_key(
+                                PROVIDER_NAME,
+                                &["versions", &version, &task.platform, &task.asset_name],
+                            )
+                            .ok_or_else(|| "Invalid OSS key".to_string())?;
 
-                if path.exists() {
-                    if let Some(expected) = &task.expected_existing {
-                        match Self::verify_file_checksum(&path, expected).await {
-                            Ok(size) => {
+                        match provider.download_asset_to_oss(&task.asset_url, &key).await {
+                            Ok(result) => {
+                                if let Some(expected) = task.asset_digest.as_deref() {
+                                    if result.sha256 != expected {
+                                        warn!(
+                                            "Checksum verification failed for {}/{}: expected {}, got {}",
+                                            version, task.platform, expected, result.sha256
+                                        );
+                                        let _ = oss::delete_object(
+                                            &provider.storage.oss,
+                                            &provider.client,
+                                            &key,
+                                        )
+                                        .await;
+                                        return Err(format!("Checksum mismatch for {}", task.platform));
+                                    }
+                                }
+
                                 info!(
-                                    "Asset verified: {}/{}/{} ({} bytes)",
-                                    version, task.platform, task.asset_name, size
+                                    "Uploaded asset: {}/{}/{} ({} bytes)",
+                                    version, task.platform, task.asset_name, result.size
                                 );
-                                return Ok((
+                                Ok((
                                     task.platform,
                                     PlatformMetadata {
-                                        sha256: expected.clone(),
-                                        size,
+                                        sha256: result.sha256,
+                                        size: result.size,
                                         filename: task.asset_name,
                                         files: HashMap::new(),
                                     },
-                                ));
+                                ))
                             }
                             Err(e) => {
-                                warn!(
-                                    "Existing asset checksum failed for {}/{}: {}",
-                                    version, task.platform, e
-                                );
-                                let _ = tokio::fs::remove_file(&path).await;
+                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                                Err(format!("Download failed for {}", task.platform))
                             }
                         }
                     } else {
-                        let _ = tokio::fs::remove_file(&path).await;
-                    }
-                }
+                        let path = provider.cache.binary_path(
+                            PROVIDER_NAME,
+                            &version,
+                            &task.platform,
+                            &task.asset_name,
+                        );
 
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-
-                match provider.download_asset_to_path(&task.asset_url, &path).await {
-                    Ok(result) => {
-                        if let Some(expected) = task.asset_digest.as_deref() {
-                            if result.sha256 != expected {
-                                warn!(
-                                    "Checksum verification failed for {}/{}: expected {}, got {}",
-                                    version, task.platform, expected, result.sha256
-                                );
+                        if path.exists() {
+                            if let Some(expected) = &task.expected_existing {
+                                match Self::verify_file_checksum(&path, expected).await {
+                                    Ok(size) => {
+                                        info!(
+                                            "Asset verified: {}/{}/{} ({} bytes)",
+                                            version, task.platform, task.asset_name, size
+                                        );
+                                        return Ok((
+                                            task.platform,
+                                            PlatformMetadata {
+                                                sha256: expected.clone(),
+                                                size,
+                                                filename: task.asset_name,
+                                                files: HashMap::new(),
+                                            },
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Existing asset checksum failed for {}/{}: {}",
+                                            version, task.platform, e
+                                        );
+                                        let _ = tokio::fs::remove_file(&path).await;
+                                    }
+                                }
+                            } else {
                                 let _ = tokio::fs::remove_file(&path).await;
-                                return Err(format!("Checksum mismatch for {}", task.platform));
                             }
                         }
 
-                        info!(
-                            "Saved asset: {}/{}/{} ({} bytes)",
-                            version, task.platform, task.asset_name, result.size
-                        );
-                        Ok((
-                            task.platform,
-                            PlatformMetadata {
-                                sha256: result.sha256,
-                                size: result.size,
-                                filename: task.asset_name,
-                                files: HashMap::new(),
-                            },
-                        ))
-                    }
-                    Err(e) => {
-                        warn!("Failed to download {}/{}: {}", version, task.platform, e);
-                        let _ = tokio::fs::remove_file(&path).await;
-                        Err(format!("Download failed for {}", task.platform))
+                        if let Some(parent) = path.parent() {
+                            tokio::fs::create_dir_all(parent)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+
+                        match provider.download_asset_to_path(&task.asset_url, &path).await {
+                            Ok(result) => {
+                                if let Some(expected) = task.asset_digest.as_deref() {
+                                    if result.sha256 != expected {
+                                        warn!(
+                                            "Checksum verification failed for {}/{}: expected {}, got {}",
+                                            version, task.platform, expected, result.sha256
+                                        );
+                                        let _ = tokio::fs::remove_file(&path).await;
+                                        return Err(format!("Checksum mismatch for {}", task.platform));
+                                    }
+                                }
+
+                                info!(
+                                    "Saved asset: {}/{}/{} ({} bytes)",
+                                    version, task.platform, task.asset_name, result.size
+                                );
+                                Ok((
+                                    task.platform,
+                                    PlatformMetadata {
+                                        sha256: result.sha256,
+                                        size: result.size,
+                                        filename: task.asset_name,
+                                        files: HashMap::new(),
+                                    },
+                                ))
+                            }
+                            Err(e) => {
+                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                                let _ = tokio::fs::remove_file(&path).await;
+                                Err(format!("Download failed for {}", task.platform))
+                            }
+                        }
                     }
                 }
-            }
             })
             .buffer_unordered(concurrency);
 
@@ -462,16 +547,34 @@ impl CodexProvider {
                 return false;
             };
 
-            if !self
-                .cache
-                .binary_exists(PROVIDER_NAME, version, platform, &platform_meta.filename)
-                .await
+            if matches!(self.storage.mode, StorageMode::Local)
+                && !self
+                    .cache
+                    .binary_exists(PROVIDER_NAME, version, platform, &platform_meta.filename)
+                    .await
             {
                 return false;
             }
         }
 
         true
+    }
+
+    async fn delete_oss_versions(&self, versions: &[VersionMetadata]) {
+        for version_meta in versions {
+            let version = &version_meta.version;
+            for (platform, meta) in &version_meta.platforms {
+                if let Some(key) = self.cache.build_object_key(
+                    PROVIDER_NAME,
+                    &["versions", version, platform, &meta.filename],
+                ) {
+                    if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await
+                    {
+                        warn!("Failed to delete OSS object {}: {}", key, e);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn sync_all(&self) -> Result<Vec<String>> {

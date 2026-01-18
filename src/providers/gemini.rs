@@ -12,8 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
-use crate::config::GeminiConfig;
+use crate::config::{GeminiConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
+use crate::oss;
 use crate::retry::{RetryPolicy, send_with_retry};
 
 const PROVIDER_NAME: &str = "gemini";
@@ -47,10 +48,11 @@ pub struct GeminiProvider {
     client: Client,
     cache: Arc<CacheManager>,
     github_token: Option<String>,
+    storage: StorageConfig,
 }
 
 impl GeminiProvider {
-    pub fn new(config: GeminiConfig, cache: Arc<CacheManager>) -> Self {
+    pub fn new(config: GeminiConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
         let client = Client::builder()
             .user_agent("duckcoding-cli-mirror/0.1.0")
             .connect_timeout(Duration::from_secs(10))
@@ -65,6 +67,7 @@ impl GeminiProvider {
             client,
             cache,
             github_token,
+            storage,
         }
     }
 
@@ -171,6 +174,36 @@ impl GeminiProvider {
         })
     }
 
+    async fn download_asset_to_oss(&self, url: &str, object_key: &str) -> Result<DownloadResult> {
+        let url = url.to_string();
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
+            .await
+            .with_context(|| format!("Failed to download asset {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to download asset {}: {}",
+                url, status
+            ))
+            .into());
+        }
+
+        let upload = oss::upload_stream(
+            &self.storage.oss,
+            &self.client,
+            object_key,
+            "application/octet-stream",
+            response.bytes_stream(),
+        )
+        .await?;
+
+        Ok(DownloadResult {
+            size: upload.size,
+            sha256: upload.sha256,
+        })
+    }
+
     async fn verify_file_checksum(path: &Path, expected: &str) -> Result<u64> {
         let mut file = tokio::fs::File::open(path).await?;
         let mut hasher = Sha256::new();
@@ -241,8 +274,11 @@ impl GeminiProvider {
             .await?;
 
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
-        if deleted > 0 {
-            info!("Cleaned up {} old versions", deleted);
+        if !deleted.is_empty() {
+            info!("Cleaned up {} old versions", deleted.len());
+            if matches!(self.storage.mode, StorageMode::Oss) {
+                self.delete_oss_versions(&deleted).await;
+            }
         }
 
         Ok(Some(upstream_version))
@@ -271,11 +307,64 @@ impl GeminiProvider {
                 ))
             })?;
 
+        let mut platforms_metadata = HashMap::new();
+
+        if matches!(self.storage.mode, StorageMode::Oss) {
+            let key = self
+                .cache
+                .build_object_key(
+                    PROVIDER_NAME,
+                    &["versions", version, GEMINI_PLATFORM, &asset.name],
+                )
+                .ok_or_else(|| MirrorError::Provider("Invalid OSS key".to_string()))?;
+            let result = self
+                .download_asset_to_oss(&asset.browser_download_url, &key)
+                .await?;
+
+            if let Some(expected) = Self::asset_digest_sha256(asset) {
+                if result.sha256 != expected {
+                    warn!(
+                        "Checksum verification failed for {}: expected {}, got {}",
+                        version, expected, result.sha256
+                    );
+                    let _ = oss::delete_object(&self.storage.oss, &self.client, &key).await;
+                    return Err(MirrorError::ChecksumMismatch {
+                        expected: expected.to_string(),
+                        actual: result.sha256,
+                    }
+                    .into());
+                }
+            }
+
+            platforms_metadata.insert(
+                GEMINI_PLATFORM.to_string(),
+                PlatformMetadata {
+                    sha256: result.sha256,
+                    size: result.size,
+                    filename: asset.name.clone(),
+                    files: HashMap::new(),
+                },
+            );
+
+            self.cache
+                .update_provider_metadata(PROVIDER_NAME, |m| {
+                    m.versions.insert(
+                        version.to_string(),
+                        VersionMetadata {
+                            version: version.to_string(),
+                            downloaded_at: Utc::now(),
+                            platforms: platforms_metadata.clone(),
+                        },
+                    );
+                })
+                .await?;
+
+            return Ok(());
+        }
+
         let path = self
             .cache
             .binary_path(PROVIDER_NAME, version, GEMINI_PLATFORM, &asset.name);
-
-        let mut platforms_metadata = HashMap::new();
 
         if path.exists() {
             let expected = existing_version
@@ -383,14 +472,35 @@ impl GeminiProvider {
             return false;
         };
 
-        self.cache
-            .binary_exists(
-                PROVIDER_NAME,
-                version,
-                GEMINI_PLATFORM,
-                &platform_meta.filename,
-            )
-            .await
+        if matches!(self.storage.mode, StorageMode::Local) {
+            self.cache
+                .binary_exists(
+                    PROVIDER_NAME,
+                    version,
+                    GEMINI_PLATFORM,
+                    &platform_meta.filename,
+                )
+                .await
+        } else {
+            true
+        }
+    }
+
+    async fn delete_oss_versions(&self, versions: &[VersionMetadata]) {
+        for version_meta in versions {
+            let version = &version_meta.version;
+            for (platform, meta) in &version_meta.platforms {
+                if let Some(key) = self.cache.build_object_key(
+                    PROVIDER_NAME,
+                    &["versions", version, platform, &meta.filename],
+                ) {
+                    if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await
+                    {
+                        warn!("Failed to delete OSS object {}: {}", key, e);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn sync_all(&self) -> Result<Vec<String>> {

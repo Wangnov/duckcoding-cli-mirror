@@ -12,8 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
-use crate::config::ClaudeCodeConfig;
+use crate::config::{ClaudeCodeConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
+use crate::oss;
 use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
 
 const PROVIDER_NAME: &str = "claude-code";
@@ -45,10 +46,11 @@ pub struct ClaudeCodeProvider {
     config: ClaudeCodeConfig,
     client: Client,
     cache: Arc<CacheManager>,
+    storage: StorageConfig,
 }
 
 impl ClaudeCodeProvider {
-    pub fn new(config: ClaudeCodeConfig, cache: Arc<CacheManager>) -> Self {
+    pub fn new(config: ClaudeCodeConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
         let client = Client::builder()
             .user_agent("duckcoding-cli-mirror/0.1.0")
             .connect_timeout(Duration::from_secs(10))
@@ -60,6 +62,7 @@ impl ClaudeCodeProvider {
             config,
             client,
             cache,
+            storage,
         }
     }
 
@@ -165,6 +168,50 @@ impl ClaudeCodeProvider {
         Ok(DownloadResult { size, sha256: hash })
     }
 
+    async fn download_binary_to_oss(
+        &self,
+        version: &str,
+        platform: &str,
+        filename: &str,
+        object_key: &str,
+    ) -> Result<DownloadResult> {
+        let url = format!(
+            "{}/{}/{}/{}",
+            self.config.upstream_url, version, platform, filename
+        );
+        info!("Downloading binary: {}", url);
+
+        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
+            .await
+            .with_context(|| format!("Failed to download binary for {}/{}", version, platform))?;
+
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(MirrorError::PlatformNotFound(platform.to_string()).into());
+        }
+        if !status.is_success() {
+            return Err(MirrorError::Provider(format!(
+                "Failed to download binary for {}/{}: {}",
+                version, platform, status
+            ))
+            .into());
+        }
+
+        let upload = oss::upload_stream(
+            &self.storage.oss,
+            &self.client,
+            object_key,
+            "application/octet-stream",
+            response.bytes_stream(),
+        )
+        .await?;
+
+        Ok(DownloadResult {
+            size: upload.size,
+            sha256: upload.sha256,
+        })
+    }
+
     async fn verify_file_checksum(path: &Path, expected: &str) -> Result<u64> {
         let mut file = tokio::fs::File::open(path).await?;
         let mut hasher = Sha256::new();
@@ -235,8 +282,11 @@ impl ClaudeCodeProvider {
 
         // Cleanup old versions
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
-        if deleted > 0 {
-            info!("Cleaned up {} old versions", deleted);
+        if !deleted.is_empty() {
+            info!("Cleaned up {} old versions", deleted.len());
+            if matches!(self.storage.mode, StorageMode::Oss) {
+                self.delete_oss_versions(&deleted).await;
+            }
         }
 
         Ok(Some(upstream_version))
@@ -254,16 +304,33 @@ impl ClaudeCodeProvider {
         // Fetch manifest
         let manifest = self.fetch_upstream_manifest(version).await?;
 
-        // Save manifest
-        let manifest_path = self
-            .cache
-            .version_path(PROVIDER_NAME, version)
-            .join("manifest.json");
-        if let Some(parent) = manifest_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        tokio::fs::write(&manifest_path, &manifest_json).await?;
+        match self.storage.mode {
+            StorageMode::Local => {
+                let manifest_path = self
+                    .cache
+                    .version_path(PROVIDER_NAME, version)
+                    .join("manifest.json");
+                if let Some(parent) = manifest_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&manifest_path, &manifest_json).await?;
+            }
+            StorageMode::Oss => {
+                let key = self
+                    .cache
+                    .build_object_key(PROVIDER_NAME, &["versions", version, "manifest.json"])
+                    .ok_or_else(|| MirrorError::Provider("Invalid manifest key".to_string()))?;
+                oss::put_bytes(
+                    &self.storage.oss,
+                    &self.client,
+                    &key,
+                    "application/json",
+                    manifest_json.into_bytes(),
+                )
+                .await?;
+            }
+        }
 
         #[derive(Clone)]
         struct PlatformTask {
@@ -302,95 +369,145 @@ impl ClaudeCodeProvider {
         let provider = self;
         let mut platforms_metadata = HashMap::new();
 
+        let oss_mode = matches!(provider.storage.mode, StorageMode::Oss);
         let mut stream = stream::iter(tasks)
             .map(|task| {
                 let version = version_label.clone();
                 async move {
-                    let path = provider.cache.binary_path(
-                        PROVIDER_NAME,
-                        &version,
-                        &task.platform,
-                        &task.filename,
-                    );
+                    if oss_mode {
+                        let key = provider
+                            .cache
+                            .build_object_key(
+                                PROVIDER_NAME,
+                                &["versions", &version, &task.platform, &task.filename],
+                            )
+                            .ok_or_else(|| "Invalid OSS key".to_string())?;
 
-                    if path.exists() {
-                        match Self::verify_file_checksum(&path, &task.checksum).await {
-                            Ok(size) => {
+                        match provider
+                            .download_binary_to_oss(&version, &task.platform, &task.filename, &key)
+                            .await
+                        {
+                            Ok(result) => {
+                                if result.sha256 != task.checksum {
+                                    warn!(
+                                        "Checksum verification failed for {}/{}: expected {}, got {}",
+                                        version, task.platform, task.checksum, result.sha256
+                                    );
+                                    let _ = oss::delete_object(
+                                        &provider.storage.oss,
+                                        &provider.client,
+                                        &key,
+                                    )
+                                    .await;
+                                    return Err(format!("Checksum mismatch for {}", task.platform));
+                                }
+
                                 info!(
-                                    "Binary verified: {}/{}/{} ({} bytes)",
-                                    version, task.platform, task.filename, size
+                                    "Uploaded binary: {}/{}/{} ({} bytes)",
+                                    version, task.platform, task.filename, result.size
                                 );
-                                return Ok((
+                                Ok((
                                     task.platform,
                                     PlatformMetadata {
                                         sha256: task.checksum,
-                                        size,
+                                        size: result.size,
                                         filename: task.filename,
                                         files: HashMap::new(),
                                     },
-                                ));
+                                ))
                             }
                             Err(e) => {
-                                warn!(
-                                    "Existing binary checksum failed for {}/{}: {}",
-                                    version, task.platform, e
-                                );
-                                let _ = tokio::fs::remove_file(&path).await;
+                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                                Err(format!("Download failed for {}", task.platform))
                             }
                         }
-                    }
+                    } else {
+                        let path = provider.cache.binary_path(
+                            PROVIDER_NAME,
+                            &version,
+                            &task.platform,
+                            &task.filename,
+                        );
 
-                    if let Some(parent) = path.parent() {
-                        tokio::fs::create_dir_all(parent)
+                        if path.exists() {
+                            match Self::verify_file_checksum(&path, &task.checksum).await {
+                                Ok(size) => {
+                                    info!(
+                                        "Binary verified: {}/{}/{} ({} bytes)",
+                                        version, task.platform, task.filename, size
+                                    );
+                                    return Ok((
+                                        task.platform,
+                                        PlatformMetadata {
+                                            sha256: task.checksum,
+                                            size,
+                                            filename: task.filename,
+                                            files: HashMap::new(),
+                                        },
+                                    ));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Existing binary checksum failed for {}/{}: {}",
+                                        version, task.platform, e
+                                    );
+                                    let _ = tokio::fs::remove_file(&path).await;
+                                }
+                            }
+                        }
+
+                        if let Some(parent) = path.parent() {
+                            tokio::fs::create_dir_all(parent)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+
+                        match provider
+                            .download_binary_to_path(&version, &task.platform, &task.filename, &path)
                             .await
-                            .map_err(|e| e.to_string())?;
-                    }
+                        {
+                            Ok(result) => {
+                                if result.sha256 != task.checksum {
+                                    warn!(
+                                        "Checksum verification failed for {}/{}: expected {}, got {}",
+                                        version, task.platform, task.checksum, result.sha256
+                                    );
+                                    let _ = tokio::fs::remove_file(&path).await;
+                                    return Err(format!("Checksum mismatch for {}", task.platform));
+                                }
 
-                    match provider
-                        .download_binary_to_path(&version, &task.platform, &task.filename, &path)
-                        .await
-                    {
-                        Ok(result) => {
-                            if result.sha256 != task.checksum {
-                                warn!(
-                                    "Checksum verification failed for {}/{}: expected {}, got {}",
-                                    version, task.platform, task.checksum, result.sha256
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let mut perms = tokio::fs::metadata(&path)
+                                        .await
+                                        .map_err(|e| e.to_string())?
+                                        .permissions();
+                                    perms.set_mode(0o755);
+                                    tokio::fs::set_permissions(&path, perms)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                }
+
+                                info!(
+                                    "Saved binary: {}/{}/{} ({} bytes)",
+                                    version, task.platform, task.filename, result.size
                                 );
+                                Ok((
+                                    task.platform,
+                                    PlatformMetadata {
+                                        sha256: task.checksum,
+                                        size: result.size,
+                                        filename: task.filename,
+                                        files: HashMap::new(),
+                                    },
+                                ))
+                            }
+                            Err(e) => {
+                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
                                 let _ = tokio::fs::remove_file(&path).await;
-                                return Err(format!("Checksum mismatch for {}", task.platform));
+                                Err(format!("Download failed for {}", task.platform))
                             }
-
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let mut perms = tokio::fs::metadata(&path)
-                                    .await
-                                    .map_err(|e| e.to_string())?
-                                    .permissions();
-                                perms.set_mode(0o755);
-                                tokio::fs::set_permissions(&path, perms)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                            }
-
-                            info!(
-                                "Saved binary: {}/{}/{} ({} bytes)",
-                                version, task.platform, task.filename, result.size
-                            );
-                            Ok((
-                                task.platform,
-                                PlatformMetadata {
-                                    sha256: task.checksum,
-                                    size: result.size,
-                                    filename: task.filename,
-                                    files: HashMap::new(),
-                                },
-                            ))
-                        }
-                        Err(e) => {
-                            warn!("Failed to download {}/{}: {}", version, task.platform, e);
-                            let _ = tokio::fs::remove_file(&path).await;
-                            Err(format!("Download failed for {}", task.platform))
                         }
                     }
                 }
@@ -450,16 +567,43 @@ impl ClaudeCodeProvider {
                 return false;
             }
 
-            if !self
-                .cache
-                .binary_exists(PROVIDER_NAME, version, platform, filename)
-                .await
+            if matches!(self.storage.mode, StorageMode::Local)
+                && !self
+                    .cache
+                    .binary_exists(PROVIDER_NAME, version, platform, filename)
+                    .await
             {
                 return false;
             }
         }
 
         true
+    }
+
+    async fn delete_oss_versions(&self, versions: &[VersionMetadata]) {
+        for version_meta in versions {
+            let version = &version_meta.version;
+            let mut keys = Vec::new();
+            if let Some(key) = self
+                .cache
+                .build_object_key(PROVIDER_NAME, &["versions", version, "manifest.json"])
+            {
+                keys.push(key);
+            }
+            for (platform, meta) in &version_meta.platforms {
+                if let Some(key) = self.cache.build_object_key(
+                    PROVIDER_NAME,
+                    &["versions", version, platform, &meta.filename],
+                ) {
+                    keys.push(key);
+                }
+            }
+            for key in keys {
+                if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await {
+                    warn!("Failed to delete OSS object {}: {}", key, e);
+                }
+            }
+        }
     }
 
     /// Sync all configured tags

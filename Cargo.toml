@@ -26,6 +26,11 @@ toml = "0.8"
 # SHA256 校验
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
+hmac = "0.12"
+sha1 = "0.10"
+urlencoding = "2.1"
+bytes = "1"
 
 # 日志追踪
 tracing = "0.1"

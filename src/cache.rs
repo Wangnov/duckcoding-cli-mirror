@@ -193,14 +193,14 @@ impl CacheManager {
     }
 
     /// Clean up old versions, keeping only max_versions
-    pub async fn cleanup_old_versions(&self, provider: &str) -> Result<usize> {
+    pub async fn cleanup_old_versions(&self, provider: &str) -> Result<Vec<VersionMetadata>> {
         if provider == "installer" {
             return self.cleanup_installer_latest().await;
         }
 
         let max_versions = self.config.max_versions;
 
-        let versions_to_remove = {
+        let (versions_to_remove, removed_metadata) = {
             let metadata = self.metadata.read().await;
             let provider_metadata = match provider {
                 "claude-code" => &metadata.claude_code,
@@ -208,7 +208,7 @@ impl CacheManager {
                 "gemini" => &metadata.gemini,
                 "node" => &metadata.node,
                 "node-pty" => &metadata.node_pty,
-                _ => return Ok(0),
+                _ => return Ok(Vec::new()),
             };
 
             // Get versions that are currently tagged (should not be deleted)
@@ -236,14 +236,24 @@ impl CacheManager {
             };
 
             // Get version names to delete
-            versions_with_time
+            let versions_to_remove = versions_with_time
                 .into_iter()
                 .take(to_delete)
                 .map(|(v, _)| v)
-                .collect::<Vec<String>>()
+                .collect::<Vec<String>>();
+
+            let removed_metadata = versions_to_remove
+                .iter()
+                .filter_map(|version| provider_metadata.versions.get(version).cloned())
+                .collect::<Vec<VersionMetadata>>();
+
+            (versions_to_remove, removed_metadata)
         };
 
-        let mut deleted_versions = Vec::new();
+        if versions_to_remove.is_empty() {
+            return Ok(Vec::new());
+        }
+
         for version in &versions_to_remove {
             let version_path = self.version_path(provider, version);
             if version_path.exists() {
@@ -254,61 +264,64 @@ impl CacheManager {
                         e
                     );
                 } else {
-                    deleted_versions.push(version.clone());
                     tracing::info!("Deleted old version: {}/{}", provider, version);
                 }
             }
         }
 
         // Save metadata if we deleted anything
-        if !deleted_versions.is_empty() {
-            let content = {
-                let mut metadata = self.metadata.write().await;
-                let provider_metadata = match provider {
-                    "claude-code" => &mut metadata.claude_code,
-                    "codex" => &mut metadata.codex,
-                    "gemini" => &mut metadata.gemini,
-                    "node" => &mut metadata.node,
-                    "node-pty" => &mut metadata.node_pty,
-                    _ => return Ok(0),
-                };
-
-                for version in &deleted_versions {
-                    provider_metadata.versions.remove(version);
-                }
-
-                serde_json::to_string_pretty(&*metadata)?
+        let content = {
+            let mut metadata = self.metadata.write().await;
+            let provider_metadata = match provider {
+                "claude-code" => &mut metadata.claude_code,
+                "codex" => &mut metadata.codex,
+                "gemini" => &mut metadata.gemini,
+                "node" => &mut metadata.node,
+                "node-pty" => &mut metadata.node_pty,
+                _ => return Ok(Vec::new()),
             };
 
-            let metadata_path = self.config.dir.join("metadata.json");
-            tokio::fs::write(&metadata_path, content).await?;
-        }
+            for version in &versions_to_remove {
+                provider_metadata.versions.remove(version);
+            }
 
-        Ok(deleted_versions.len())
+            serde_json::to_string_pretty(&*metadata)?
+        };
+
+        let metadata_path = self.config.dir.join("metadata.json");
+        tokio::fs::write(&metadata_path, content).await?;
+
+        Ok(removed_metadata)
     }
 
-    async fn cleanup_installer_latest(&self) -> Result<usize> {
-        let versions_to_remove = {
+    async fn cleanup_installer_latest(&self) -> Result<Vec<VersionMetadata>> {
+        let (versions_to_remove, removed_metadata) = {
             let metadata = self.metadata.read().await;
             let Some(latest) = metadata.installer.tags.get("latest") else {
                 tracing::warn!("Installer latest tag not set; skip cleanup");
-                return Ok(0);
+                return Ok(Vec::new());
             };
 
-            metadata
+            let versions_to_remove = metadata
                 .installer
                 .versions
                 .keys()
                 .filter(|version| *version != latest)
                 .cloned()
-                .collect::<Vec<String>>()
+                .collect::<Vec<String>>();
+
+            let removed_metadata = versions_to_remove
+                .iter()
+                .filter_map(|version| metadata.installer.versions.get(version).cloned())
+                .collect::<Vec<VersionMetadata>>();
+
+            (versions_to_remove, removed_metadata)
         };
 
         if versions_to_remove.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
-        let mut deleted_versions = Vec::new();
         for version in &versions_to_remove {
             let version_path = self.version_path("installer", version);
             if version_path.exists() {
@@ -319,28 +332,25 @@ impl CacheManager {
                         e
                     );
                 } else {
-                    deleted_versions.push(version.clone());
                     tracing::info!("Deleted old version: installer/{}", version);
                 }
             }
         }
 
-        if !deleted_versions.is_empty() {
-            let content = {
-                let mut metadata = self.metadata.write().await;
-                let provider_metadata = &mut metadata.installer;
-                for version in &deleted_versions {
-                    provider_metadata.versions.remove(version);
-                }
+        let content = {
+            let mut metadata = self.metadata.write().await;
+            let provider_metadata = &mut metadata.installer;
+            for version in &versions_to_remove {
+                provider_metadata.versions.remove(version);
+            }
 
-                serde_json::to_string_pretty(&*metadata)?
-            };
+            serde_json::to_string_pretty(&*metadata)?
+        };
 
-            let metadata_path = self.config.dir.join("metadata.json");
-            tokio::fs::write(&metadata_path, content).await?;
-        }
+        let metadata_path = self.config.dir.join("metadata.json");
+        tokio::fs::write(&metadata_path, content).await?;
 
-        Ok(deleted_versions.len())
+        Ok(removed_metadata)
     }
 
     /// Get file path for serving
@@ -355,6 +365,22 @@ impl CacheManager {
             result = result.join(segment);
         }
         if result.exists() { Some(result) } else { None }
+    }
+
+    /// Build object key for storage backend (without checking existence)
+    pub fn build_object_key(&self, provider: &str, path_segments: &[&str]) -> Option<String> {
+        if provider.contains("..") || provider.contains('/') || provider.contains('\\') {
+            return None;
+        }
+        let mut key = provider.to_string();
+        for segment in path_segments {
+            if segment.contains("..") || segment.contains('/') || segment.contains('\\') {
+                return None;
+            }
+            key.push('/');
+            key.push_str(segment);
+        }
+        Some(key)
     }
 }
 

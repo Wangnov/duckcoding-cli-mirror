@@ -1,6 +1,7 @@
 mod cache;
 mod config;
 mod error;
+mod oss;
 mod providers;
 mod retry;
 mod server;

@@ -9,6 +9,9 @@ pub struct Config {
     pub server: ServerConfig,
 
     #[serde(default)]
+    pub storage: StorageConfig,
+
+    #[serde(default)]
     pub cache: CacheConfig,
 
     #[serde(default)]
@@ -45,6 +48,139 @@ pub struct ServerConfig {
     /// If not set, install script endpoints will return 503
     #[serde(default)]
     pub public_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_storage_mode")]
+    pub mode: StorageMode,
+
+    #[serde(default)]
+    pub oss: OssConfig,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_storage_mode(),
+            oss: OssConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageMode {
+    Local,
+    Oss,
+}
+
+impl Default for StorageMode {
+    fn default() -> Self {
+        StorageMode::Local
+    }
+}
+
+fn default_storage_mode() -> StorageMode {
+    match std::env::var("MIRROR_STORAGE_MODE")
+        .ok()
+        .as_deref()
+        .map(|s| s.to_lowercase())
+    {
+        Some(ref v) if v == "oss" => StorageMode::Oss,
+        _ => StorageMode::Local,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OssConfig {
+    #[serde(default = "default_oss_endpoint")]
+    pub endpoint: String,
+
+    #[serde(default = "default_oss_bucket")]
+    pub bucket: String,
+
+    #[serde(default = "default_oss_access_key_id")]
+    pub access_key_id: String,
+
+    #[serde(default = "default_oss_access_key_secret")]
+    pub access_key_secret: String,
+
+    #[serde(default = "default_oss_security_token")]
+    pub security_token: Option<String>,
+
+    #[serde(default = "default_oss_prefix")]
+    pub prefix: String,
+
+    #[serde(default = "default_oss_https")]
+    pub https: bool,
+
+    #[serde(default = "default_oss_path_style")]
+    pub path_style: bool,
+
+    #[serde(default = "default_oss_expires_seconds")]
+    pub expires_seconds: u64,
+}
+
+impl Default for OssConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_oss_endpoint(),
+            bucket: default_oss_bucket(),
+            access_key_id: default_oss_access_key_id(),
+            access_key_secret: default_oss_access_key_secret(),
+            security_token: default_oss_security_token(),
+            prefix: default_oss_prefix(),
+            https: default_oss_https(),
+            path_style: default_oss_path_style(),
+            expires_seconds: default_oss_expires_seconds(),
+        }
+    }
+}
+
+fn default_oss_endpoint() -> String {
+    std::env::var("MIRROR_OSS_ENDPOINT").unwrap_or_default()
+}
+
+fn default_oss_bucket() -> String {
+    std::env::var("MIRROR_OSS_BUCKET").unwrap_or_default()
+}
+
+fn default_oss_access_key_id() -> String {
+    std::env::var("MIRROR_OSS_ACCESS_KEY_ID").unwrap_or_default()
+}
+
+fn default_oss_access_key_secret() -> String {
+    std::env::var("MIRROR_OSS_ACCESS_KEY_SECRET").unwrap_or_default()
+}
+
+fn default_oss_security_token() -> Option<String> {
+    std::env::var("MIRROR_OSS_SECURITY_TOKEN").ok()
+}
+
+fn default_oss_prefix() -> String {
+    std::env::var("MIRROR_OSS_PREFIX").unwrap_or_default()
+}
+
+fn default_oss_https() -> bool {
+    std::env::var("MIRROR_OSS_HTTPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true)
+}
+
+fn default_oss_path_style() -> bool {
+    std::env::var("MIRROR_OSS_PATH_STYLE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false)
+}
+
+fn default_oss_expires_seconds() -> u64 {
+    std::env::var("MIRROR_OSS_EXPIRES_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900)
 }
 
 impl Default for ServerConfig {
@@ -453,6 +589,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.server.port, 1357);
         assert_eq!(config.server.host, "0.0.0.0");
+        assert!(matches!(config.storage.mode, StorageMode::Local));
         assert_eq!(config.cache.max_versions, 10);
         assert!(config.update.enabled);
         assert_eq!(config.update.interval_minutes, 10);
@@ -471,6 +608,19 @@ mod tests {
 port = 8080
 host = "127.0.0.1"
 public_url = "http://example.com"
+
+[storage]
+mode = "oss"
+
+[storage.oss]
+endpoint = "oss-cn-hangzhou.aliyuncs.com"
+bucket = "example-bucket"
+access_key_id = "test-id"
+access_key_secret = "test-secret"
+prefix = "mirror"
+https = true
+path_style = false
+expires_seconds = 600
 
 [cache]
 dir = "/tmp/cache"
@@ -506,6 +656,9 @@ repo = "openai/codex"
         assert_eq!(config.claude_code.tags, vec!["stable"]);
         assert_eq!(config.codex.tags, vec!["stable", "latest"]);
         assert!(config.codex.include_prerelease);
+        assert!(matches!(config.storage.mode, StorageMode::Oss));
+        assert_eq!(config.storage.oss.bucket, "example-bucket");
+        assert_eq!(config.storage.oss.expires_seconds, 600);
     }
 
     #[test]

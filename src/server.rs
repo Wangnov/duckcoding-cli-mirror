@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use std::sync::Arc;
+use std::{io::ErrorKind, sync::Arc};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, interval};
 use tokio_util::io::ReaderStream;
@@ -16,7 +16,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::cache::{CacheManager, ProviderMetadata};
-use crate::config::Config;
+use crate::config::{Config, StorageMode};
+use crate::oss;
 use crate::providers::{
     ClaudeCodeProvider, CodexProvider, GeminiProvider, InstallerProvider, NodeProvider,
     NodePtyProvider,
@@ -39,12 +40,15 @@ pub async fn run(config: Config, cache: CacheManager) -> Result<()> {
     let cache = Arc::new(cache);
 
     // Create providers
-    let claude_code = ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone());
-    let codex = CodexProvider::new(config.codex.clone(), cache.clone());
-    let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone());
-    let installer = InstallerProvider::new(config.installer.clone(), cache.clone());
-    let node = NodeProvider::new(config.node.clone(), cache.clone());
-    let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone());
+    let storage = config.storage.clone();
+    let claude_code =
+        ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone(), storage.clone());
+    let codex = CodexProvider::new(config.codex.clone(), cache.clone(), storage.clone());
+    let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone(), storage.clone());
+    let installer =
+        InstallerProvider::new(config.installer.clone(), cache.clone(), storage.clone());
+    let node = NodeProvider::new(config.node.clone(), cache.clone(), storage.clone());
+    let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone(), storage);
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -192,6 +196,74 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+async fn serve_storage_file(
+    state: &AppState,
+    provider: &str,
+    path_segments: &[&str],
+    content_type: &'static str,
+    filename: Option<&str>,
+) -> Result<Response, StatusCode> {
+    let key = state
+        .cache
+        .build_object_key(provider, path_segments)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    match state.config.storage.mode {
+        StorageMode::Local => serve_local_file(state, &key, content_type, filename).await,
+        StorageMode::Oss => serve_oss_redirect(state, &key),
+    }
+}
+
+async fn serve_local_file(
+    state: &AppState,
+    key: &str,
+    content_type: &'static str,
+    filename: Option<&str>,
+) -> Result<Response, StatusCode> {
+    let path = state.cache.config.dir.join(key);
+    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+        if e.kind() == ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, metadata.len());
+
+    if let Some(name) = filename {
+        builder = builder.header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", name),
+        );
+    }
+
+    Ok(builder.body(body).unwrap())
+}
+
+fn serve_oss_redirect(state: &AppState, key: &str) -> Result<Response, StatusCode> {
+    let url = oss::presign_get_url(&state.config.storage.oss, key).map_err(|e| {
+        error!("Failed to presign OSS URL: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, url)
+        .body(Body::empty())
+        .unwrap())
+}
+
 // Get tag version
 async fn claude_code_tag(
     State(state): State<Arc<AppState>>,
@@ -295,19 +367,14 @@ async fn claude_code_manifest(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let path = state
-        .cache
-        .get_file_path("claude-code", &["versions", &version, "manifest.json"])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(content))
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "claude-code",
+        &["versions", &version, "manifest.json"],
+        "application/json",
+        None,
+    )
+    .await
 }
 
 // Download binary
@@ -325,38 +392,14 @@ async fn claude_code_binary(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let path = state
-        .cache
-        .get_file_path(
-            "claude-code",
-            &["versions", &version, &platform, expected_filename],
-        )
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Open file and stream it
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    let content_type = "application/octet-stream";
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, metadata.len())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .body(body)
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "claude-code",
+        &["versions", &version, &platform, expected_filename],
+        "application/octet-stream",
+        Some(expected_filename),
+    )
+    .await
 }
 
 // Download Codex binary/archive
@@ -379,32 +422,14 @@ async fn codex_binary(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let path = state
-        .cache
-        .get_file_path("codex", &["versions", &version, &platform, &filename])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, metadata.len())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .body(body)
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "codex",
+        &["versions", &version, &platform, &filename],
+        "application/octet-stream",
+        Some(&filename),
+    )
+    .await
 }
 
 // Download Gemini CLI JS
@@ -412,32 +437,14 @@ async fn gemini_binary(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let path = state
-        .cache
-        .get_file_path("gemini", &["versions", &version, "universal", "gemini.js"])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, metadata.len())
-        .header(
-            header::CONTENT_DISPOSITION,
-            "attachment; filename=\"gemini.js\"",
-        )
-        .body(body)
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "gemini",
+        &["versions", &version, "universal", "gemini.js"],
+        "application/octet-stream",
+        Some("gemini.js"),
+    )
+    .await
 }
 
 // Download installer binary
@@ -460,32 +467,14 @@ async fn installer_binary(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let path = state
-        .cache
-        .get_file_path("installer", &["versions", &version, &platform, &filename])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, metadata.len())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .body(body)
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "installer",
+        &["versions", &version, &platform, &filename],
+        "application/octet-stream",
+        Some(&filename),
+    )
+    .await
 }
 
 // Installer checksum helper
@@ -531,70 +520,42 @@ async fn node_binary(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let path = state
-        .cache
-        .get_file_path("node", &["versions", &version, &platform, &filename])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, metadata.len())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .body(body)
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "node",
+        &["versions", &version, &platform, &filename],
+        "application/octet-stream",
+        Some(&filename),
+    )
+    .await
 }
 
 async fn node_checksums(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let path = state
-        .cache
-        .get_file_path("node", &["versions", &version, "checksums.json"])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(content))
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "node",
+        &["versions", &version, "checksums.json"],
+        "application/json",
+        None,
+    )
+    .await
 }
 
 async fn node_shasums(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let path = state
-        .cache
-        .get_file_path("node", &["versions", &version, "SHASUMS256.txt"])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(content))
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "node",
+        &["versions", &version, "SHASUMS256.txt"],
+        "text/plain",
+        None,
+    )
+    .await
 }
 
 // Download node-pty prebuild file
@@ -622,54 +583,28 @@ async fn node_pty_binary(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let path = state
-        .cache
-        .get_file_path(
-            "node-pty",
-            &["versions", &version, "prebuilds", &platform, &filename],
-        )
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, metadata.len())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .body(body)
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "node-pty",
+        &["versions", &version, "prebuilds", &platform, &filename],
+        "application/octet-stream",
+        Some(&filename),
+    )
+    .await
 }
 
 async fn node_pty_checksums(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let path = state
-        .cache
-        .get_file_path("node-pty", &["versions", &version, "checksums.json"])
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(content))
-        .unwrap())
+    serve_storage_file(
+        state.as_ref(),
+        "node-pty",
+        &["versions", &version, "checksums.json"],
+        "application/json",
+        None,
+    )
+    .await
 }
 
 // Install script for Linux/macOS

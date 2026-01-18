@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
+use crate::oss;
 
 const PROVIDER_NAME: &str = "node";
 
@@ -32,24 +35,49 @@ struct ChecksumsEntry {
 pub struct NodeProvider {
     config: NodeConfig,
     cache: Arc<CacheManager>,
+    client: Client,
+    storage: StorageConfig,
 }
 
 impl NodeProvider {
-    pub fn new(config: NodeConfig, cache: Arc<CacheManager>) -> Self {
-        Self { config, cache }
+    pub fn new(config: NodeConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
+        let client = Client::builder()
+            .user_agent("duckcoding-cli-mirror/0.1.0")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("Failed to create HTTP client");
+        Self {
+            config,
+            cache,
+            client,
+            storage,
+        }
     }
 
     async fn read_checksums(&self, version: &str) -> Result<ChecksumsFile> {
-        let path = self
-            .cache
-            .get_file_path(PROVIDER_NAME, &["versions", version, "checksums.json"])
-            .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
+        match self.storage.mode {
+            StorageMode::Local => {
+                let path = self
+                    .cache
+                    .get_file_path(PROVIDER_NAME, &["versions", version, "checksums.json"])
+                    .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
 
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to read checksums.json for {}", version))?;
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("Failed to read checksums.json for {}", version))?;
 
-        Ok(serde_json::from_str(&content)?)
+                Ok(serde_json::from_str(&content)?)
+            }
+            StorageMode::Oss => {
+                let key = self
+                    .cache
+                    .build_object_key(PROVIDER_NAME, &["versions", version, "checksums.json"])
+                    .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
+                let content = oss::get_object_bytes(&self.storage.oss, &self.client, &key).await?;
+                Ok(serde_json::from_slice(&content)?)
+            }
+        }
     }
 
     fn select_single_file(
@@ -110,8 +138,11 @@ impl NodeProvider {
             .await?;
 
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
-        if deleted > 0 {
-            info!("Cleaned up {} old versions", deleted);
+        if !deleted.is_empty() {
+            info!("Cleaned up {} old versions", deleted.len());
+            if matches!(self.storage.mode, StorageMode::Oss) {
+                self.delete_oss_versions(&deleted).await;
+            }
         }
 
         Ok(Some(version))
@@ -139,15 +170,17 @@ impl NodeProvider {
                 .cache
                 .binary_path(PROVIDER_NAME, version, platform, &filename);
 
-            if !path.exists() {
-                return Err(MirrorError::Provider(format!(
-                    "Missing file for {}/{}: {}",
-                    version, platform, filename
-                ))
-                .into());
-            }
+            if matches!(self.storage.mode, StorageMode::Local) {
+                if !path.exists() {
+                    return Err(MirrorError::Provider(format!(
+                        "Missing file for {}/{}: {}",
+                        version, platform, filename
+                    ))
+                    .into());
+                }
 
-            Self::verify_file_size(&path, entry.size).await?;
+                Self::verify_file_size(&path, entry.size).await?;
+            }
 
             platforms_metadata.insert(
                 platform.clone(),
@@ -188,16 +221,49 @@ impl NodeProvider {
                 return false;
             };
 
-            if !self
-                .cache
-                .binary_exists(PROVIDER_NAME, version, platform, &platform_meta.filename)
-                .await
+            if matches!(self.storage.mode, StorageMode::Local)
+                && !self
+                    .cache
+                    .binary_exists(PROVIDER_NAME, version, platform, &platform_meta.filename)
+                    .await
             {
                 return false;
             }
         }
 
         true
+    }
+
+    async fn delete_oss_versions(&self, versions: &[VersionMetadata]) {
+        for version_meta in versions {
+            let version = &version_meta.version;
+            let mut keys = Vec::new();
+            if let Some(key) = self
+                .cache
+                .build_object_key(PROVIDER_NAME, &["versions", version, "checksums.json"])
+            {
+                keys.push(key);
+            }
+            if let Some(key) = self
+                .cache
+                .build_object_key(PROVIDER_NAME, &["versions", version, "SHASUMS256.txt"])
+            {
+                keys.push(key);
+            }
+            for (platform, meta) in &version_meta.platforms {
+                if let Some(key) = self.cache.build_object_key(
+                    PROVIDER_NAME,
+                    &["versions", version, platform, &meta.filename],
+                ) {
+                    keys.push(key);
+                }
+            }
+            for key in keys {
+                if let Err(e) = oss::delete_object(&self.storage.oss, &self.client, &key).await {
+                    warn!("Failed to delete OSS object {}: {}", key, e);
+                }
+            }
+        }
     }
 
     pub async fn sync_all(&self) -> Result<Vec<String>> {
