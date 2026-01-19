@@ -49,7 +49,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 # 命令行参数
 clap = { version = "4", features = ["derive"] }
-aliyun-oss-client = "0.12.10"
+oss-sdk-rs = "1.2.4"
 
 [dev-dependencies]
 tempfile = "3"
@@ -74,11 +74,3 @@ strip = "symbols"
 
 [profile.release]
 strip = "symbols"
-
-[profile.release.package.duckcoding-cli-installer]
-opt-level = "z"
-codegen-units = 1
-
-[profile.dist.package.duckcoding-cli-installer]
-opt-level = "z"
-codegen-units = 1

@@ -1,15 +1,17 @@
-use aliyun_oss_client::file::Files;
-use aliyun_oss_client::{BucketName, Client as OssClient, EndPoint, ObjectPath};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
+use oss_sdk_rs::errors::OSSError;
+use oss_sdk_rs::object::ObjectAPI;
+use oss_sdk_rs::oss::OSS;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
 use crate::config::OssConfig;
 
@@ -26,21 +28,43 @@ pub async fn put_bytes(
     body: Vec<u8>,
 ) -> Result<()> {
     let client = oss_client(config)?;
-    let path = object_path(config, object_key)?;
+    let key = object_key_with_prefix(config, object_key);
+    let headers = content_type_headers(content_type);
     client
-        .put_content_base(body, content_type, path)
+        .put_object(
+            body.as_slice(),
+            key,
+            headers,
+            None::<std::collections::HashMap<String, Option<String>>>,
+        )
         .await
-        .map_err(|err| anyhow::anyhow!("Failed to upload object {}: {}", object_key, err))?;
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to upload object {}: {}",
+                object_key,
+                format_oss_error(&err)
+            )
+        })?;
     Ok(())
 }
 
 pub async fn get_object_bytes(config: &OssConfig, object_key: &str) -> Result<Bytes> {
     let client = oss_client(config)?;
-    let path = object_path(config, object_key)?;
+    let key = object_key_with_prefix(config, object_key);
     let content = client
-        .get_object(path, ..)
+        .get_object(
+            key,
+            None::<std::collections::HashMap<String, String>>,
+            None::<std::collections::HashMap<String, Option<String>>>,
+        )
         .await
-        .map_err(|err| anyhow::anyhow!("Failed to fetch object {}: {}", object_key, err))?;
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to fetch object {}: {}",
+                object_key,
+                format_oss_error(&err)
+            )
+        })?;
     Ok(Bytes::from(content))
 }
 
@@ -99,11 +123,14 @@ where
 
 pub async fn delete_object(config: &OssConfig, object_key: &str) -> Result<()> {
     let client = oss_client(config)?;
-    let path = object_path(config, object_key)?;
-    client
-        .delete_object(path)
-        .await
-        .map_err(|err| anyhow::anyhow!("Failed to delete object {}: {}", object_key, err))?;
+    let key = object_key_with_prefix(config, object_key);
+    client.delete_object(key).await.map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to delete object {}: {}",
+            object_key,
+            format_oss_error(&err)
+        )
+    })?;
     Ok(())
 }
 
@@ -114,12 +141,24 @@ pub async fn upload_file(
     path: &PathBuf,
 ) -> Result<()> {
     let client = oss_client(config)?;
-    let path_key = object_path(config, object_key)?;
+    let key = object_key_with_prefix(config, object_key);
     let content = tokio::fs::read(path).await?;
+    let headers = content_type_headers(content_type);
     client
-        .put_content_base(content, content_type, path_key)
+        .put_object(
+            content.as_slice(),
+            key,
+            headers,
+            None::<std::collections::HashMap<String, Option<String>>>,
+        )
         .await
-        .map_err(|err| anyhow::anyhow!("Failed to upload object {}: {}", object_key, err))?;
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to upload object {}: {}",
+                object_key,
+                format_oss_error(&err)
+            )
+        })?;
     Ok(())
 }
 
@@ -160,50 +199,47 @@ fn temp_path_for(object_key: &str) -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("dc-mirror-{}-{}.tmp", name, ts)))
 }
 
-fn object_path(config: &OssConfig, object_key: &str) -> Result<ObjectPath> {
-    let key = join_prefix(&config.prefix, object_key);
-    let path = key
-        .parse::<ObjectPath>()
-        .map_err(|err| anyhow::anyhow!("Invalid OSS object path {}: {}", key, err))?;
-    Ok(path)
+fn object_key_with_prefix(config: &OssConfig, object_key: &str) -> String {
+    join_prefix(&config.prefix, object_key)
 }
 
-fn oss_client(config: &OssConfig) -> Result<OssClient> {
+fn oss_client(config: &OssConfig) -> Result<OSS<'static>> {
     validate_config(config)?;
-    let bucket: BucketName = config
-        .bucket
-        .parse()
-        .map_err(|err| anyhow::anyhow!("Invalid OSS bucket {}: {}", config.bucket, err))?;
-    let endpoint = parse_endpoint(config)?;
-    Ok(OssClient::new(
-        config.access_key_id.clone().into(),
-        config.access_key_secret.clone().into(),
+    if config.path_style {
+        anyhow::bail!("oss-sdk-rs does not support path-style endpoints");
+    }
+    if config.security_token.is_some() {
+        warn!(
+            "OSS security_token is set but oss-sdk-rs does not support STS; token will be ignored"
+        );
+    }
+    let endpoint = normalize_endpoint(config);
+    Ok(OSS::new(
+        config.access_key_id.clone(),
+        config.access_key_secret.clone(),
         endpoint,
-        bucket,
+        config.bucket.clone(),
     ))
 }
 
-fn parse_endpoint(config: &OssConfig) -> Result<EndPoint> {
+fn normalize_endpoint(config: &OssConfig) -> String {
     let endpoint = config.endpoint.trim();
-    let endpoint = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint.to_string()
-    } else if endpoint.contains('.') {
+    } else {
         let scheme = if config.https { "https" } else { "http" };
         format!("{scheme}://{endpoint}")
-    } else {
-        endpoint.to_string()
-    };
-
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        let url = endpoint
-            .parse::<reqwest::Url>()
-            .context("Failed to parse OSS endpoint URL")?;
-        return EndPoint::try_from(url)
-            .map_err(|err| anyhow::anyhow!("Invalid OSS endpoint {}: {}", config.endpoint, err));
     }
+}
 
-    EndPoint::try_from(endpoint.as_str())
-        .map_err(|err| anyhow::anyhow!("Invalid OSS endpoint {}: {}", config.endpoint, err))
+fn content_type_headers(content_type: &str) -> std::collections::HashMap<String, String> {
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers
+}
+
+fn format_oss_error(err: &OSSError) -> String {
+    format!("{:?}", err)
 }
 
 fn encode_object_key(key: &str) -> String {
