@@ -402,7 +402,7 @@ impl GeminiProvider {
                         return Ok(());
                     }
                     Err(e) => {
-                        warn!("Existing asset checksum failed for {}: {}", version, e);
+                        warn!("Existing asset checksum failed for {}: {:?}", version, e);
                         let _ = tokio::fs::remove_file(&path).await;
                     }
                 }
@@ -494,7 +494,7 @@ impl GeminiProvider {
                     &["versions", version, platform, &meta.filename],
                 ) {
                     if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                        warn!("Failed to delete OSS object {}: {}", key, e);
+                        warn!("Failed to delete OSS object {}: {:?}", key, e);
                     }
                 }
             }
@@ -508,7 +508,7 @@ impl GeminiProvider {
             match self.sync_tag(tag).await {
                 Ok(Some(version)) => updated.push(format!("{}: {}", tag, version)),
                 Ok(None) => {}
-                Err(e) => warn!("Failed to sync tag {}: {}", tag, e),
+                Err(e) => warn!("Failed to sync tag {}: {:?}", tag, e),
             }
         }
 

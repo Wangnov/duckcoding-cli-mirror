@@ -410,7 +410,7 @@ impl ClaudeCodeProvider {
                                 ))
                             }
                             Err(e) => {
-                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                                warn!("Failed to download {}/{}: {:?}", version, task.platform, e);
                                 Err(format!("Download failed for {}", task.platform))
                             }
                         }
@@ -441,7 +441,7 @@ impl ClaudeCodeProvider {
                                 }
                                 Err(e) => {
                                     warn!(
-                                        "Existing binary checksum failed for {}/{}: {}",
+                                        "Existing binary checksum failed for {}/{}: {:?}",
                                         version, task.platform, e
                                     );
                                     let _ = tokio::fs::remove_file(&path).await;
@@ -497,7 +497,7 @@ impl ClaudeCodeProvider {
                                 ))
                             }
                             Err(e) => {
-                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                                warn!("Failed to download {}/{}: {:?}", version, task.platform, e);
                                 let _ = tokio::fs::remove_file(&path).await;
                                 Err(format!("Download failed for {}", task.platform))
                             }
@@ -593,7 +593,7 @@ impl ClaudeCodeProvider {
             }
             for key in keys {
                 if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                    warn!("Failed to delete OSS object {}: {}", key, e);
+                    warn!("Failed to delete OSS object {}: {:?}", key, e);
                 }
             }
         }
@@ -610,7 +610,7 @@ impl ClaudeCodeProvider {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("Failed to sync tag {}: {}", tag, e);
+                    warn!("Failed to sync tag {}: {:?}", tag, e);
                 }
             }
         }

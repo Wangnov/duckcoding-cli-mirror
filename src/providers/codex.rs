@@ -408,7 +408,7 @@ impl CodexProvider {
                                 ))
                             }
                             Err(e) => {
-                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                                warn!("Failed to download {}/{}: {:?}", version, task.platform, e);
                                 Err(format!("Download failed for {}", task.platform))
                             }
                         }
@@ -440,7 +440,7 @@ impl CodexProvider {
                                     }
                                     Err(e) => {
                                         warn!(
-                                            "Existing asset checksum failed for {}/{}: {}",
+                                            "Existing asset checksum failed for {}/{}: {:?}",
                                             version, task.platform, e
                                         );
                                         let _ = tokio::fs::remove_file(&path).await;
@@ -485,7 +485,7 @@ impl CodexProvider {
                                 ))
                             }
                             Err(e) => {
-                                warn!("Failed to download {}/{}: {}", version, task.platform, e);
+                                warn!("Failed to download {}/{}: {:?}", version, task.platform, e);
                                 let _ = tokio::fs::remove_file(&path).await;
                                 Err(format!("Download failed for {}", task.platform))
                             }
@@ -563,7 +563,7 @@ impl CodexProvider {
                     &["versions", version, platform, &meta.filename],
                 ) {
                     if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                        warn!("Failed to delete OSS object {}: {}", key, e);
+                        warn!("Failed to delete OSS object {}: {:?}", key, e);
                     }
                 }
             }
@@ -577,7 +577,7 @@ impl CodexProvider {
             match self.sync_tag(tag).await {
                 Ok(Some(version)) => updated.push(format!("{}: {}", tag, version)),
                 Ok(None) => {}
-                Err(e) => warn!("Failed to sync tag {}: {}", tag, e),
+                Err(e) => warn!("Failed to sync tag {}: {:?}", tag, e),
             }
         }
 

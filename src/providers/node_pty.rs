@@ -276,7 +276,7 @@ impl NodePtyProvider {
 
             for key in keys {
                 if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                    warn!("Failed to delete OSS object {}: {}", key, e);
+                    warn!("Failed to delete OSS object {}: {:?}", key, e);
                 }
             }
         }
@@ -289,7 +289,7 @@ impl NodePtyProvider {
             match self.sync_tag(tag).await {
                 Ok(Some(version)) => updated.push(format!("{}: {}", tag, version)),
                 Ok(None) => {}
-                Err(e) => warn!("Failed to sync tag {}: {}", tag, e),
+                Err(e) => warn!("Failed to sync tag {}: {:?}", tag, e),
             }
         }
 
