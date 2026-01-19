@@ -6,7 +6,6 @@ use hmac::{Hmac, Mac};
 use oss_sdk_rs::errors::OSSError;
 use oss_sdk_rs::object::ObjectAPI;
 use oss_sdk_rs::oss::OSS;
-use reqwest::StatusCode;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -244,24 +243,12 @@ fn format_oss_error(err: &OSSError) -> String {
 }
 
 async fn ensure_object_absent(client: &OSS<'_>, key: &str) -> Result<()> {
-    match client.head_object(key).await {
-        Ok(_) => {
-            client.delete_object(key).await.map_err(|err| {
-                anyhow::anyhow!(
-                    "Failed to delete OSS object {}: {}",
-                    key,
-                    format_oss_error(&err)
-                )
-            })?;
-        }
-        Err(OSSError::Object { status_code, .. }) if status_code == StatusCode::NOT_FOUND => {}
-        Err(err) => {
-            return Err(anyhow::anyhow!(
-                "Failed to check OSS object {}: {}",
-                key,
-                format_oss_error(&err)
-            ));
-        }
+    if let Err(err) = client.delete_object(key).await {
+        return Err(anyhow::anyhow!(
+            "Failed to delete OSS object {}: {}",
+            key,
+            format_oss_error(&err)
+        ));
     }
     Ok(())
 }
