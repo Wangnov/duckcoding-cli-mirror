@@ -10,9 +10,9 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::OssConfig;
 
@@ -79,6 +79,7 @@ pub async fn upload_stream<S>(
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
+    info!("Streaming download for OSS object {}", object_key);
     let temp_path = temp_path_for(object_key)?;
     let mut file = tokio::fs::File::create(&temp_path).await?;
     let mut hasher = Sha256::new();
@@ -109,8 +110,14 @@ where
         }
     };
 
+    info!(
+        "Downloaded to temp file for {} ({} bytes, sha256: {})",
+        object_key, upload_result.size, upload_result.sha256
+    );
+
     drop(file);
 
+    let upload_started = Instant::now();
     let upload_result = match upload_file(config, object_key, content_type, &temp_path).await {
         Ok(()) => upload_result,
         Err(err) => {
@@ -120,6 +127,12 @@ where
     };
 
     let _ = tokio::fs::remove_file(&temp_path).await;
+    info!(
+        "Uploaded OSS object {} ({} bytes) in {:?}",
+        object_key,
+        upload_result.size,
+        upload_started.elapsed()
+    );
     Ok(upload_result)
 }
 
@@ -146,9 +159,16 @@ pub async fn upload_file(
     let key = object_key_with_prefix(config, object_key);
     ensure_object_absent(&client, &key).await?;
 
+    let total_size = tokio::fs::metadata(path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     let mut file = tokio::fs::File::open(path).await?;
     let mut position: u64 = 0;
     let mut buffer = vec![0u8; APPEND_CHUNK_SIZE];
+    let mut uploaded: u64 = 0;
+    let mut last_logged: u64 = 0;
+    const LOG_EVERY_BYTES: u64 = 64 * 1024 * 1024;
 
     loop {
         let read = file.read(&mut buffer).await?;
@@ -157,6 +177,18 @@ pub async fn upload_file(
         }
 
         position = append_chunk(&client, &key, content_type, position, &buffer[..read]).await?;
+        uploaded += read as u64;
+        if uploaded.saturating_sub(last_logged) >= LOG_EVERY_BYTES {
+            info!(
+                "Uploading OSS object {} ({} / {} bytes)",
+                object_key, uploaded, total_size
+            );
+            last_logged = uploaded;
+        }
+    }
+
+    if total_size > 0 {
+        info!("Finished OSS upload {} ({} bytes)", object_key, total_size);
     }
 
     Ok(())
