@@ -516,6 +516,12 @@ impl GeminiProvider {
     }
 
     pub async fn get_tag_version(&self, tag: &str) -> Option<String> {
+        if tag == "stable" {
+            if let Some(version) = self.cache.read_tag(PROVIDER_NAME, "stable").await {
+                return Some(version);
+            }
+            return self.cache.read_tag(PROVIDER_NAME, "latest").await;
+        }
         self.cache.read_tag(PROVIDER_NAME, tag).await
     }
 
@@ -523,10 +529,14 @@ impl GeminiProvider {
         let metadata = self.cache.get_metadata().await;
         let provider = &metadata.gemini;
 
-        let display_version = provider
-            .tags
-            .get("latest")
-            .or_else(|| provider.tags.get("stable"));
+        let mut tags = provider.tags.clone();
+        if !tags.contains_key("stable") {
+            if let Some(latest) = tags.get("latest").cloned() {
+                tags.insert("stable".to_string(), latest);
+            }
+        }
+
+        let display_version = tags.get("latest").or_else(|| tags.get("stable"));
 
         let mut platforms = serde_json::Map::new();
 
@@ -547,7 +557,7 @@ impl GeminiProvider {
         }
 
         serde_json::json!({
-            "tags": provider.tags,
+            "tags": tags,
             "platforms": platforms,
             "updated_at": provider.updated_at
         })

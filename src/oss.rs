@@ -6,16 +6,19 @@ use hmac::{Hmac, Mac};
 use oss_sdk_rs::errors::OSSError;
 use oss_sdk_rs::object::ObjectAPI;
 use oss_sdk_rs::oss::OSS;
+use reqwest::StatusCode;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 
 use crate::config::OssConfig;
 
 type HmacSha1 = Hmac<Sha1>;
+const APPEND_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 pub fn presign_get_url(config: &OssConfig, object_key: &str) -> Result<String> {
     presign_url(config, "GET", object_key, None)
@@ -142,23 +145,21 @@ pub async fn upload_file(
 ) -> Result<()> {
     let client = oss_client(config)?;
     let key = object_key_with_prefix(config, object_key);
-    let content = tokio::fs::read(path).await?;
-    let headers = content_type_headers(content_type);
-    client
-        .put_object(
-            content.as_slice(),
-            key,
-            headers,
-            None::<std::collections::HashMap<String, Option<String>>>,
-        )
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "Failed to upload object {}: {}",
-                object_key,
-                format_oss_error(&err)
-            )
-        })?;
+    ensure_object_absent(&client, &key).await?;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut position: u64 = 0;
+    let mut buffer = vec![0u8; APPEND_CHUNK_SIZE];
+
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        position = append_chunk(&client, &key, content_type, position, &buffer[..read]).await?;
+    }
+
     Ok(())
 }
 
@@ -240,6 +241,55 @@ fn content_type_headers(content_type: &str) -> std::collections::HashMap<String,
 
 fn format_oss_error(err: &OSSError) -> String {
     format!("{:?}", err)
+}
+
+async fn ensure_object_absent(client: &OSS<'_>, key: &str) -> Result<()> {
+    match client.head_object(key).await {
+        Ok(_) => {
+            client.delete_object(key).await.map_err(|err| {
+                anyhow::anyhow!(
+                    "Failed to delete OSS object {}: {}",
+                    key,
+                    format_oss_error(&err)
+                )
+            })?;
+        }
+        Err(OSSError::Object { status_code, .. }) if status_code == StatusCode::NOT_FOUND => {}
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "Failed to check OSS object {}: {}",
+                key,
+                format_oss_error(&err)
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn append_chunk(
+    client: &OSS<'_>,
+    key: &str,
+    content_type: &str,
+    position: u64,
+    chunk: &[u8],
+) -> Result<u64> {
+    let headers = content_type_headers(content_type);
+    let mut resources: HashMap<String, Option<String>> = HashMap::new();
+    resources.insert("append".to_string(), None);
+    resources.insert("position".to_string(), Some(position.to_string()));
+
+    let next = client
+        .append_object(chunk, key, headers, resources)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to append OSS object {}: {}",
+                key,
+                format_oss_error(&err)
+            )
+        })?;
+
+    Ok(next.unwrap_or(position + chunk.len() as u64))
 }
 
 fn encode_object_key(key: &str) -> String {
