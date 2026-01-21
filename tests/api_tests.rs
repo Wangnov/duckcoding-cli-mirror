@@ -40,10 +40,12 @@ fn create_test_state() -> (TempDir, Arc<AppState>) {
     let cache = CacheManager::new(&config.cache).unwrap();
     let cache = Arc::new(cache);
     let storage = config.storage.clone();
-    let provider = ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone(), storage.clone());
+    let provider =
+        ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone(), storage.clone());
     let codex = CodexProvider::new(config.codex.clone(), cache.clone(), storage.clone());
     let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone(), storage.clone());
-    let installer = InstallerProvider::new(config.installer.clone(), cache.clone(), storage.clone());
+    let installer =
+        InstallerProvider::new(config.installer.clone(), cache.clone(), storage.clone());
     let node = NodeProvider::new(config.node.clone(), cache.clone(), storage.clone());
     let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone(), storage);
 

@@ -16,6 +16,7 @@ use crate::config::{ClaudeCodeConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
 use crate::oss;
 use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
+use crate::s3;
 
 const PROVIDER_NAME: &str = "claude-code";
 
@@ -168,7 +169,7 @@ impl ClaudeCodeProvider {
         Ok(DownloadResult { size, sha256: hash })
     }
 
-    async fn download_binary_to_oss(
+    async fn download_binary_to_remote(
         &self,
         version: &str,
         platform: &str,
@@ -197,18 +198,71 @@ impl ClaudeCodeProvider {
             .into());
         }
 
-        let upload = oss::upload_stream(
-            &self.storage.oss,
-            object_key,
-            "application/octet-stream",
-            response.bytes_stream(),
-        )
-        .await?;
+        let total_size = response.content_length();
+        let (size, sha256) = if matches!(self.storage.mode, StorageMode::Oss) {
+            let upload = oss::upload_stream(
+                &self.storage.oss,
+                object_key,
+                "application/octet-stream",
+                total_size,
+                response.bytes_stream(),
+            )
+            .await?;
+            (upload.size, upload.sha256)
+        } else if matches!(self.storage.mode, StorageMode::S3) {
+            let upload = s3::upload_stream(
+                &self.storage.s3,
+                object_key,
+                "application/octet-stream",
+                total_size,
+                response.bytes_stream(),
+            )
+            .await?;
+            (upload.size, upload.sha256)
+        } else {
+            return Err(MirrorError::Provider(
+                "download_binary_to_remote called in local mode".to_string(),
+            )
+            .into());
+        };
 
-        Ok(DownloadResult {
-            size: upload.size,
-            sha256: upload.sha256,
-        })
+        Ok(DownloadResult { size, sha256 })
+    }
+
+    async fn try_use_existing_s3_object(
+        &self,
+        object_key: &str,
+        expected_sha256: &str,
+        expected_size: u64,
+    ) -> Result<Option<DownloadResult>> {
+        let info = s3::head_object_info(&self.storage.s3, object_key).await?;
+        let Some(info) = info else {
+            return Ok(None);
+        };
+        let Some(actual_sha256) = info.sha256 else {
+            return Ok(None);
+        };
+
+        if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+            return Ok(None);
+        }
+
+        if expected_size > 0 {
+            if let Some(size) = info.size {
+                if size != expected_size {
+                    warn!(
+                        "S3 object size mismatch for {}: expected {}, got {}",
+                        object_key, expected_size, size
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(Some(DownloadResult {
+            size: info.size.unwrap_or(expected_size),
+            sha256: expected_sha256.to_string(),
+        }))
     }
 
     async fn verify_file_checksum(path: &Path, expected: &str) -> Result<u64> {
@@ -283,7 +337,7 @@ impl ClaudeCodeProvider {
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
         if !deleted.is_empty() {
             info!("Cleaned up {} old versions", deleted.len());
-            if matches!(self.storage.mode, StorageMode::Oss) {
+            if matches!(self.storage.mode, StorageMode::Oss | StorageMode::S3) {
                 self.delete_oss_versions(&deleted).await;
             }
         }
@@ -328,6 +382,19 @@ impl ClaudeCodeProvider {
                 )
                 .await?;
             }
+            StorageMode::S3 => {
+                let key = self
+                    .cache
+                    .build_object_key(PROVIDER_NAME, &["versions", version, "manifest.json"])
+                    .ok_or_else(|| MirrorError::Provider("Invalid manifest key".to_string()))?;
+                s3::put_bytes(
+                    &self.storage.s3,
+                    &key,
+                    "application/json",
+                    manifest_json.into_bytes(),
+                )
+                .await?;
+            }
         }
 
         #[derive(Clone)]
@@ -335,6 +402,7 @@ impl ClaudeCodeProvider {
             platform: String,
             checksum: String,
             filename: String,
+            size: u64,
         }
 
         let mut tasks = Vec::new();
@@ -359,6 +427,7 @@ impl ClaudeCodeProvider {
                 platform: platform.clone(),
                 checksum: platform_manifest.checksum.clone(),
                 filename: filename.to_string(),
+                size: platform_manifest.size,
             });
         }
 
@@ -367,53 +436,88 @@ impl ClaudeCodeProvider {
         let provider = self;
         let mut platforms_metadata = HashMap::new();
 
-        let oss_mode = matches!(provider.storage.mode, StorageMode::Oss);
+        let storage_mode = provider.storage.mode.clone();
+        let remote_mode = matches!(storage_mode, StorageMode::Oss | StorageMode::S3);
         let mut stream = stream::iter(tasks)
             .map(|task| {
                 let version = version_label.clone();
+                let storage_mode = storage_mode.clone();
                 async move {
-                    if oss_mode {
+                    if remote_mode {
                         let key = provider
                             .cache
                             .build_object_key(
                                 PROVIDER_NAME,
                                 &["versions", &version, &task.platform, &task.filename],
                             )
-                            .ok_or_else(|| "Invalid OSS key".to_string())?;
+                            .ok_or_else(|| "Invalid storage key".to_string())?;
 
-                        match provider
-                            .download_binary_to_oss(&version, &task.platform, &task.filename, &key)
-                            .await
-                        {
-                            Ok(result) => {
-                                if result.sha256 != task.checksum {
+                        let existing = if matches!(storage_mode, StorageMode::S3) {
+                            provider
+                                .try_use_existing_s3_object(&key, &task.checksum, task.size)
+                                .await
+                                .map_err(|e| e.to_string())?
+                        } else {
+                            None
+                        };
+
+                        let result = if let Some(result) = existing {
+                            info!(
+                                "S3 object already present for {}/{} (sha256 match), skip download",
+                                version, task.platform
+                            );
+                            result
+                        } else {
+                            match provider
+                                .download_binary_to_remote(
+                                    &version,
+                                    &task.platform,
+                                    &task.filename,
+                                    &key,
+                                )
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(e) => {
                                     warn!(
-                                        "Checksum verification failed for {}/{}: expected {}, got {}",
-                                        version, task.platform, task.checksum, result.sha256
+                                        "Failed to download {}/{}: {:?}",
+                                        version, task.platform, e
                                     );
-                                    let _ = oss::delete_object(&provider.storage.oss, &key).await;
-                                    return Err(format!("Checksum mismatch for {}", task.platform));
+                                    return Err(format!("Download failed for {}", task.platform));
                                 }
+                            }
+                        };
 
-                                info!(
-                                    "Uploaded binary: {}/{}/{} ({} bytes)",
-                                    version, task.platform, task.filename, result.size
-                                );
-                                Ok((
-                                    task.platform,
-                                    PlatformMetadata {
-                                        sha256: task.checksum,
-                                        size: result.size,
-                                        filename: task.filename,
-                                        files: HashMap::new(),
-                                    },
-                                ))
+                        if result.sha256 != task.checksum {
+                            warn!(
+                                "Checksum verification failed for {}/{}: expected {}, got {}",
+                                version, task.platform, task.checksum, result.sha256
+                            );
+                            match storage_mode {
+                                StorageMode::Oss => {
+                                    let _ = oss::delete_object(&provider.storage.oss, &key).await;
+                                }
+                                StorageMode::S3 => {
+                                    let _ = s3::delete_object(&provider.storage.s3, &key).await;
+                                }
+                                StorageMode::Local => {}
                             }
-                            Err(e) => {
-                                warn!("Failed to download {}/{}: {:?}", version, task.platform, e);
-                                Err(format!("Download failed for {}", task.platform))
-                            }
+                            return Err(format!("Checksum mismatch for {}", task.platform));
                         }
+
+                        info!(
+                            "Uploaded binary: {}/{}/{} ({} bytes)",
+                            version, task.platform, task.filename, result.size
+                        );
+                        Ok((
+                            task.platform,
+                            PlatformMetadata {
+                                sha256: task.checksum,
+                                size: result.size,
+                                filename: task.filename,
+                                files: HashMap::new(),
+                            },
+                        ))
                     } else {
                         let path = provider.cache.binary_path(
                             PROVIDER_NAME,
@@ -592,8 +696,18 @@ impl ClaudeCodeProvider {
                 }
             }
             for key in keys {
-                if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                    warn!("Failed to delete OSS object {}: {:?}", key, e);
+                match self.storage.mode {
+                    StorageMode::Oss => {
+                        if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
+                            warn!("Failed to delete OSS object {}: {:?}", key, e);
+                        }
+                    }
+                    StorageMode::S3 => {
+                        if let Err(e) = s3::delete_object(&self.storage.s3, &key).await {
+                            warn!("Failed to delete S3 object {}: {:?}", key, e);
+                        }
+                    }
+                    StorageMode::Local => {}
                 }
             }
         }

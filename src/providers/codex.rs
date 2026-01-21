@@ -16,6 +16,7 @@ use crate::config::{CodexConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
 use crate::oss;
 use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
+use crate::s3;
 
 const PROVIDER_NAME: &str = "codex";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -196,7 +197,11 @@ impl CodexProvider {
         })
     }
 
-    async fn download_asset_to_oss(&self, url: &str, object_key: &str) -> Result<DownloadResult> {
+    async fn download_asset_to_remote(
+        &self,
+        url: &str,
+        object_key: &str,
+    ) -> Result<DownloadResult> {
         let url = url.to_string();
         let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
             .await
@@ -211,18 +216,60 @@ impl CodexProvider {
             .into());
         }
 
-        let upload = oss::upload_stream(
-            &self.storage.oss,
-            object_key,
-            "application/octet-stream",
-            response.bytes_stream(),
-        )
-        .await?;
+        let total_size = response.content_length();
+        let (size, sha256) = if matches!(self.storage.mode, StorageMode::Oss) {
+            let upload = oss::upload_stream(
+                &self.storage.oss,
+                object_key,
+                "application/octet-stream",
+                total_size,
+                response.bytes_stream(),
+            )
+            .await?;
+            (upload.size, upload.sha256)
+        } else if matches!(self.storage.mode, StorageMode::S3) {
+            let upload = s3::upload_stream(
+                &self.storage.s3,
+                object_key,
+                "application/octet-stream",
+                total_size,
+                response.bytes_stream(),
+            )
+            .await?;
+            (upload.size, upload.sha256)
+        } else {
+            return Err(MirrorError::Provider(
+                "download_asset_to_remote called in local mode".to_string(),
+            )
+            .into());
+        };
 
-        Ok(DownloadResult {
-            size: upload.size,
-            sha256: upload.sha256,
-        })
+        Ok(DownloadResult { size, sha256 })
+    }
+
+    async fn try_use_existing_s3_object(
+        &self,
+        object_key: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Option<DownloadResult>> {
+        let info = s3::head_object_info(&self.storage.s3, object_key).await?;
+        let Some(info) = info else {
+            return Ok(None);
+        };
+        let Some(actual_sha256) = info.sha256 else {
+            return Ok(None);
+        };
+
+        if let Some(expected) = expected_sha256 {
+            if !actual_sha256.eq_ignore_ascii_case(expected) {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(DownloadResult {
+            size: info.size.unwrap_or(0),
+            sha256: actual_sha256,
+        }))
     }
 
     async fn verify_file_checksum(path: &Path, expected: &str) -> Result<u64> {
@@ -297,7 +344,7 @@ impl CodexProvider {
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
         if !deleted.is_empty() {
             info!("Cleaned up {} old versions", deleted.len());
-            if matches!(self.storage.mode, StorageMode::Oss) {
+            if matches!(self.storage.mode, StorageMode::Oss | StorageMode::S3) {
                 self.delete_oss_versions(&deleted).await;
             }
         }
@@ -366,52 +413,88 @@ impl CodexProvider {
         let provider = self;
         let mut platforms_metadata = HashMap::new();
 
-        let oss_mode = matches!(provider.storage.mode, StorageMode::Oss);
+        let storage_mode = provider.storage.mode.clone();
+        let remote_mode = matches!(storage_mode, StorageMode::Oss | StorageMode::S3);
         let mut stream = stream::iter(tasks)
             .map(|task| {
                 let version = version_label.clone();
+                let storage_mode = storage_mode.clone();
                 async move {
-                    if oss_mode {
+                    if remote_mode {
                         let key = provider
                             .cache
                             .build_object_key(
                                 PROVIDER_NAME,
                                 &["versions", &version, &task.platform, &task.asset_name],
                             )
-                            .ok_or_else(|| "Invalid OSS key".to_string())?;
+                            .ok_or_else(|| "Invalid storage key".to_string())?;
 
-                        match provider.download_asset_to_oss(&task.asset_url, &key).await {
-                            Ok(result) => {
-                                if let Some(expected) = task.asset_digest.as_deref() {
-                                    if result.sha256 != expected {
-                                        warn!(
-                                            "Checksum verification failed for {}/{}: expected {}, got {}",
-                                            version, task.platform, expected, result.sha256
-                                        );
-                                        let _ = oss::delete_object(&provider.storage.oss, &key).await;
-                                        return Err(format!("Checksum mismatch for {}", task.platform));
-                                    }
+                        let expected_sha = task
+                            .asset_digest
+                            .as_deref()
+                            .or(task.expected_existing.as_deref());
+                        let existing = if matches!(storage_mode, StorageMode::S3) {
+                            provider
+                                .try_use_existing_s3_object(&key, expected_sha)
+                                .await
+                                .map_err(|e| e.to_string())?
+                        } else {
+                            None
+                        };
+
+                        let result = if let Some(result) = existing {
+                            info!(
+                                "S3 object already present for {}/{} (sha256 match), skip download",
+                                version, task.platform
+                            );
+                            result
+                        } else {
+                            match provider.download_asset_to_remote(&task.asset_url, &key).await {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to download {}/{}: {:?}",
+                                        version, task.platform, e
+                                    );
+                                    return Err(format!("Download failed for {}", task.platform));
                                 }
-
-                                info!(
-                                    "Uploaded asset: {}/{}/{} ({} bytes)",
-                                    version, task.platform, task.asset_name, result.size
-                                );
-                                Ok((
-                                    task.platform,
-                                    PlatformMetadata {
-                                        sha256: result.sha256,
-                                        size: result.size,
-                                        filename: task.asset_name,
-                                        files: HashMap::new(),
-                                    },
-                                ))
                             }
-                            Err(e) => {
-                                warn!("Failed to download {}/{}: {:?}", version, task.platform, e);
-                                Err(format!("Download failed for {}", task.platform))
+                        };
+
+                        if let Some(expected) = task.asset_digest.as_deref() {
+                            if result.sha256 != expected {
+                                warn!(
+                                    "Checksum verification failed for {}/{}: expected {}, got {}",
+                                    version, task.platform, expected, result.sha256
+                                );
+                                match storage_mode {
+                                    StorageMode::Oss => {
+                                        let _ =
+                                            oss::delete_object(&provider.storage.oss, &key).await;
+                                    }
+                                    StorageMode::S3 => {
+                                        let _ =
+                                            s3::delete_object(&provider.storage.s3, &key).await;
+                                    }
+                                    StorageMode::Local => {}
+                                }
+                                return Err(format!("Checksum mismatch for {}", task.platform));
                             }
                         }
+
+                        info!(
+                            "Uploaded asset: {}/{}/{} ({} bytes)",
+                            version, task.platform, task.asset_name, result.size
+                        );
+                        Ok((
+                            task.platform,
+                            PlatformMetadata {
+                                sha256: result.sha256,
+                                size: result.size,
+                                filename: task.asset_name,
+                                files: HashMap::new(),
+                            },
+                        ))
                     } else {
                         let path = provider.cache.binary_path(
                             PROVIDER_NAME,
@@ -562,8 +645,18 @@ impl CodexProvider {
                     PROVIDER_NAME,
                     &["versions", version, platform, &meta.filename],
                 ) {
-                    if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                        warn!("Failed to delete OSS object {}: {:?}", key, e);
+                    match self.storage.mode {
+                        StorageMode::Oss => {
+                            if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
+                                warn!("Failed to delete OSS object {}: {:?}", key, e);
+                            }
+                        }
+                        StorageMode::S3 => {
+                            if let Err(e) = s3::delete_object(&self.storage.s3, &key).await {
+                                warn!("Failed to delete S3 object {}: {:?}", key, e);
+                            }
+                        }
+                        StorageMode::Local => {}
                     }
                 }
             }

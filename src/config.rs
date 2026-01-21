@@ -57,6 +57,9 @@ pub struct StorageConfig {
 
     #[serde(default)]
     pub oss: OssConfig,
+
+    #[serde(default)]
+    pub s3: S3Config,
 }
 
 impl Default for StorageConfig {
@@ -64,21 +67,19 @@ impl Default for StorageConfig {
         Self {
             mode: default_storage_mode(),
             oss: OssConfig::default(),
+            s3: S3Config::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageMode {
+    #[default]
     Local,
     Oss,
-}
-
-impl Default for StorageMode {
-    fn default() -> Self {
-        StorageMode::Local
-    }
+    #[serde(alias = "r2")]
+    S3,
 }
 
 fn default_storage_mode() -> StorageMode {
@@ -88,6 +89,7 @@ fn default_storage_mode() -> StorageMode {
         .map(|s| s.to_lowercase())
     {
         Some(ref v) if v == "oss" => StorageMode::Oss,
+        Some(ref v) if v == "s3" || v == "r2" => StorageMode::S3,
         _ => StorageMode::Local,
     }
 }
@@ -178,6 +180,94 @@ fn default_oss_path_style() -> bool {
 
 fn default_oss_expires_seconds() -> u64 {
     std::env::var("MIRROR_OSS_EXPIRES_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    #[serde(default = "default_s3_endpoint")]
+    pub endpoint: String,
+
+    #[serde(default = "default_s3_bucket")]
+    pub bucket: String,
+
+    #[serde(default = "default_s3_access_key_id")]
+    pub access_key_id: String,
+
+    #[serde(default = "default_s3_secret_access_key")]
+    pub secret_access_key: String,
+
+    #[serde(default = "default_s3_session_token")]
+    pub session_token: Option<String>,
+
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+
+    #[serde(default = "default_s3_prefix")]
+    pub prefix: String,
+
+    #[serde(default = "default_s3_path_style")]
+    pub path_style: bool,
+
+    #[serde(default = "default_s3_expires_seconds")]
+    pub expires_seconds: u64,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            endpoint: default_s3_endpoint(),
+            bucket: default_s3_bucket(),
+            access_key_id: default_s3_access_key_id(),
+            secret_access_key: default_s3_secret_access_key(),
+            session_token: default_s3_session_token(),
+            region: default_s3_region(),
+            prefix: default_s3_prefix(),
+            path_style: default_s3_path_style(),
+            expires_seconds: default_s3_expires_seconds(),
+        }
+    }
+}
+
+fn default_s3_endpoint() -> String {
+    std::env::var("MIRROR_S3_ENDPOINT").unwrap_or_default()
+}
+
+fn default_s3_bucket() -> String {
+    std::env::var("MIRROR_S3_BUCKET").unwrap_or_default()
+}
+
+fn default_s3_access_key_id() -> String {
+    std::env::var("MIRROR_S3_ACCESS_KEY_ID").unwrap_or_default()
+}
+
+fn default_s3_secret_access_key() -> String {
+    std::env::var("MIRROR_S3_SECRET_ACCESS_KEY").unwrap_or_default()
+}
+
+fn default_s3_session_token() -> Option<String> {
+    std::env::var("MIRROR_S3_SESSION_TOKEN").ok()
+}
+
+fn default_s3_region() -> String {
+    std::env::var("MIRROR_S3_REGION").unwrap_or_else(|_| "auto".to_string())
+}
+
+fn default_s3_prefix() -> String {
+    std::env::var("MIRROR_S3_PREFIX").unwrap_or_default()
+}
+
+fn default_s3_path_style() -> bool {
+    std::env::var("MIRROR_S3_PATH_STYLE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true)
+}
+
+fn default_s3_expires_seconds() -> u64 {
+    std::env::var("MIRROR_S3_EXPIRES_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(900)

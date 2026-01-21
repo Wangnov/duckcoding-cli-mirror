@@ -10,6 +10,7 @@ use crate::cache::{CacheManager, FileMetadata, PlatformMetadata, VersionMetadata
 use crate::config::{NodePtyConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
 use crate::oss;
+use crate::s3;
 
 const PROVIDER_NAME: &str = "node-pty";
 const PRIMARY_FILE: &str = "pty.node";
@@ -77,6 +78,14 @@ impl NodePtyProvider {
                 let content = oss::get_object_bytes(&self.storage.oss, &key).await?;
                 Ok(serde_json::from_slice(&content)?)
             }
+            StorageMode::S3 => {
+                let key = self
+                    .cache
+                    .build_object_key(PROVIDER_NAME, &["versions", version, "checksums.json"])
+                    .ok_or_else(|| MirrorError::VersionNotFound(version.to_string()))?;
+                let content = s3::get_object_bytes(&self.storage.s3, &key).await?;
+                Ok(serde_json::from_slice(&content)?)
+            }
         }
     }
 
@@ -117,7 +126,7 @@ impl NodePtyProvider {
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
         if !deleted.is_empty() {
             info!("Cleaned up {} old versions", deleted.len());
-            if matches!(self.storage.mode, StorageMode::Oss) {
+            if matches!(self.storage.mode, StorageMode::Oss | StorageMode::S3) {
                 self.delete_oss_versions(&deleted).await;
             }
         }
@@ -275,8 +284,18 @@ impl NodePtyProvider {
             }
 
             for key in keys {
-                if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                    warn!("Failed to delete OSS object {}: {:?}", key, e);
+                match self.storage.mode {
+                    StorageMode::Oss => {
+                        if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
+                            warn!("Failed to delete OSS object {}: {:?}", key, e);
+                        }
+                    }
+                    StorageMode::S3 => {
+                        if let Err(e) = s3::delete_object(&self.storage.s3, &key).await {
+                            warn!("Failed to delete S3 object {}: {:?}", key, e);
+                        }
+                    }
+                    StorageMode::Local => {}
                 }
             }
         }

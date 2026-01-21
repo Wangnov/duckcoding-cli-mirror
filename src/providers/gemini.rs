@@ -16,6 +16,7 @@ use crate::config::{GeminiConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
 use crate::oss;
 use crate::retry::{RetryPolicy, send_with_retry};
+use crate::s3;
 
 const PROVIDER_NAME: &str = "gemini";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -174,7 +175,11 @@ impl GeminiProvider {
         })
     }
 
-    async fn download_asset_to_oss(&self, url: &str, object_key: &str) -> Result<DownloadResult> {
+    async fn download_asset_to_remote(
+        &self,
+        url: &str,
+        object_key: &str,
+    ) -> Result<DownloadResult> {
         let url = url.to_string();
         let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
             .await
@@ -189,18 +194,60 @@ impl GeminiProvider {
             .into());
         }
 
-        let upload = oss::upload_stream(
-            &self.storage.oss,
-            object_key,
-            "application/octet-stream",
-            response.bytes_stream(),
-        )
-        .await?;
+        let total_size = response.content_length();
+        let (size, sha256) = if matches!(self.storage.mode, StorageMode::Oss) {
+            let upload = oss::upload_stream(
+                &self.storage.oss,
+                object_key,
+                "application/octet-stream",
+                total_size,
+                response.bytes_stream(),
+            )
+            .await?;
+            (upload.size, upload.sha256)
+        } else if matches!(self.storage.mode, StorageMode::S3) {
+            let upload = s3::upload_stream(
+                &self.storage.s3,
+                object_key,
+                "application/octet-stream",
+                total_size,
+                response.bytes_stream(),
+            )
+            .await?;
+            (upload.size, upload.sha256)
+        } else {
+            return Err(MirrorError::Provider(
+                "download_asset_to_remote called in local mode".to_string(),
+            )
+            .into());
+        };
 
-        Ok(DownloadResult {
-            size: upload.size,
-            sha256: upload.sha256,
-        })
+        Ok(DownloadResult { size, sha256 })
+    }
+
+    async fn try_use_existing_s3_object(
+        &self,
+        object_key: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Option<DownloadResult>> {
+        let info = s3::head_object_info(&self.storage.s3, object_key).await?;
+        let Some(info) = info else {
+            return Ok(None);
+        };
+        let Some(actual_sha256) = info.sha256 else {
+            return Ok(None);
+        };
+
+        if let Some(expected) = expected_sha256 {
+            if !actual_sha256.eq_ignore_ascii_case(expected) {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(DownloadResult {
+            size: info.size.unwrap_or(0),
+            sha256: actual_sha256,
+        }))
     }
 
     async fn verify_file_checksum(path: &Path, expected: &str) -> Result<u64> {
@@ -275,7 +322,7 @@ impl GeminiProvider {
         let deleted = self.cache.cleanup_old_versions(PROVIDER_NAME).await?;
         if !deleted.is_empty() {
             info!("Cleaned up {} old versions", deleted.len());
-            if matches!(self.storage.mode, StorageMode::Oss) {
+            if matches!(self.storage.mode, StorageMode::Oss | StorageMode::S3) {
                 self.delete_oss_versions(&deleted).await;
             }
         }
@@ -308,17 +355,38 @@ impl GeminiProvider {
 
         let mut platforms_metadata = HashMap::new();
 
-        if matches!(self.storage.mode, StorageMode::Oss) {
+        if matches!(self.storage.mode, StorageMode::Oss | StorageMode::S3) {
+            let expected_existing = existing_version
+                .and_then(|version_meta| version_meta.platforms.get(GEMINI_PLATFORM))
+                .map(|meta| meta.sha256.clone());
+            let expected_sha = Self::asset_digest_sha256(asset)
+                .map(str::to_string)
+                .or(expected_existing);
             let key = self
                 .cache
                 .build_object_key(
                     PROVIDER_NAME,
                     &["versions", version, GEMINI_PLATFORM, &asset.name],
                 )
-                .ok_or_else(|| MirrorError::Provider("Invalid OSS key".to_string()))?;
-            let result = self
-                .download_asset_to_oss(&asset.browser_download_url, &key)
-                .await?;
+                .ok_or_else(|| MirrorError::Provider("Invalid storage key".to_string()))?;
+            let result = if matches!(self.storage.mode, StorageMode::S3) {
+                if let Some(result) = self
+                    .try_use_existing_s3_object(&key, expected_sha.as_deref())
+                    .await?
+                {
+                    info!(
+                        "S3 object already present for {} (sha256 match), skip download",
+                        version
+                    );
+                    result
+                } else {
+                    self.download_asset_to_remote(&asset.browser_download_url, &key)
+                        .await?
+                }
+            } else {
+                self.download_asset_to_remote(&asset.browser_download_url, &key)
+                    .await?
+            };
 
             if let Some(expected) = Self::asset_digest_sha256(asset) {
                 if result.sha256 != expected {
@@ -326,7 +394,15 @@ impl GeminiProvider {
                         "Checksum verification failed for {}: expected {}, got {}",
                         version, expected, result.sha256
                     );
-                    let _ = oss::delete_object(&self.storage.oss, &key).await;
+                    match self.storage.mode {
+                        StorageMode::Oss => {
+                            let _ = oss::delete_object(&self.storage.oss, &key).await;
+                        }
+                        StorageMode::S3 => {
+                            let _ = s3::delete_object(&self.storage.s3, &key).await;
+                        }
+                        StorageMode::Local => {}
+                    }
                     return Err(MirrorError::ChecksumMismatch {
                         expected: expected.to_string(),
                         actual: result.sha256,
@@ -493,8 +569,18 @@ impl GeminiProvider {
                     PROVIDER_NAME,
                     &["versions", version, platform, &meta.filename],
                 ) {
-                    if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                        warn!("Failed to delete OSS object {}: {:?}", key, e);
+                    match self.storage.mode {
+                        StorageMode::Oss => {
+                            if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
+                                warn!("Failed to delete OSS object {}: {:?}", key, e);
+                            }
+                        }
+                        StorageMode::S3 => {
+                            if let Err(e) = s3::delete_object(&self.storage.s3, &key).await {
+                                warn!("Failed to delete S3 object {}: {:?}", key, e);
+                            }
+                        }
+                        StorageMode::Local => {}
                     }
                 }
             }

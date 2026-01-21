@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::OssConfig;
 
@@ -67,23 +67,34 @@ pub async fn get_object_bytes(config: &OssConfig, object_key: &str) -> Result<By
                 format_oss_error(&err)
             )
         })?;
-    Ok(Bytes::from(content))
+    Ok(content)
 }
 
 pub async fn upload_stream<S>(
     config: &OssConfig,
     object_key: &str,
     content_type: &str,
+    total_size: Option<u64>,
     stream: S,
 ) -> Result<UploadResult>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
-    info!("Streaming download for OSS object {}", object_key);
+    let log_every_bytes = progress_log_interval(total_size);
+    let total_hint = total_size
+        .filter(|t| *t > 0)
+        .map(|t| format!(" (total: {})", format_bytes(t)))
+        .unwrap_or_default();
+    info!(
+        "Downloading upstream stream for OSS upload {}{}",
+        object_key, total_hint
+    );
     let temp_path = temp_path_for(object_key)?;
     let mut file = tokio::fs::File::create(&temp_path).await?;
     let mut hasher = Sha256::new();
     let mut size: u64 = 0;
+    let mut last_logged: u64 = 0;
+    let download_started = Instant::now();
 
     let upload_result = async {
         let mut upstream = Box::pin(stream);
@@ -92,6 +103,28 @@ where
             size += chunk.len() as u64;
             hasher.update(&chunk);
             file.write_all(&chunk).await?;
+            if size.saturating_sub(last_logged) >= log_every_bytes {
+                let speed = format_rate(size, download_started.elapsed());
+                if let Some(total) = total_size.filter(|t| *t > 0) {
+                    let pct = (size as f64 / total as f64) * 100.0;
+                    debug!(
+                        "Downloaded {}/{} ({:.1}%), {} for OSS object {}",
+                        format_bytes(size),
+                        format_bytes(total),
+                        pct.min(100.0),
+                        speed,
+                        object_key
+                    );
+                } else {
+                    debug!(
+                        "Downloaded {} ({}) for OSS object {}",
+                        format_bytes(size),
+                        speed,
+                        object_key
+                    );
+                }
+                last_logged = size;
+            }
         }
         file.flush().await?;
         Ok::<_, anyhow::Error>(UploadResult {
@@ -111,12 +144,13 @@ where
     };
 
     info!(
-        "Downloaded to temp file for {} ({} bytes, sha256: {})",
+        "Downloaded upstream to temp file for OSS object {} ({} bytes, sha256: {})",
         object_key, upload_result.size, upload_result.sha256
     );
 
     drop(file);
 
+    info!("Uploading to OSS object {}", object_key);
     let upload_started = Instant::now();
     let upload_result = match upload_file(config, object_key, content_type, &temp_path).await {
         Ok(()) => upload_result,
@@ -229,6 +263,53 @@ fn temp_path_for(object_key: &str) -> Result<PathBuf> {
         .context("Failed to get time for temp path")?
         .as_nanos();
     Ok(std::env::temp_dir().join(format!("dc-mirror-{}-{}.tmp", name, ts)))
+}
+
+fn progress_log_interval(total_size: Option<u64>) -> u64 {
+    let max_interval = 5 * 1024 * 1024;
+    let min_interval = 512 * 1024;
+    match total_size {
+        Some(total) if total > 0 => {
+            let by_percent = total / 20;
+            let mut interval = by_percent.clamp(min_interval, max_interval);
+            if total < min_interval {
+                interval = total;
+            }
+            if interval == 0 {
+                interval = min_interval;
+            }
+            interval
+        }
+        _ => max_interval,
+    }
+}
+
+fn format_rate(bytes: u64, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return "0 B/s".to_string();
+    }
+    let per_sec = (bytes as f64 / secs).round().max(0.0) as u64;
+    format!("{}/s", format_bytes(per_sec))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut idx = 0usize;
+    while size >= 1024.0 && idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{} {}", bytes, UNITS[idx])
+    } else if size >= 100.0 {
+        format!("{:.0} {}", size, UNITS[idx])
+    } else if size >= 10.0 {
+        format!("{:.1} {}", size, UNITS[idx])
+    } else {
+        format!("{:.2} {}", size, UNITS[idx])
+    }
 }
 
 fn object_key_with_prefix(config: &OssConfig, object_key: &str) -> String {

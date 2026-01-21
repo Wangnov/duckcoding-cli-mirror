@@ -22,6 +22,7 @@ use crate::providers::{
     ClaudeCodeProvider, CodexProvider, GeminiProvider, InstallerProvider, NodeProvider,
     NodePtyProvider,
 };
+use crate::s3;
 
 /// Shared application state
 pub struct AppState {
@@ -211,6 +212,7 @@ async fn serve_storage_file(
     match state.config.storage.mode {
         StorageMode::Local => serve_local_file(state, &key, content_type, filename).await,
         StorageMode::Oss => serve_oss_redirect(state, &key),
+        StorageMode::S3 => serve_s3_redirect(state, &key).await,
     }
 }
 
@@ -256,6 +258,21 @@ fn serve_oss_redirect(state: &AppState, key: &str) -> Result<Response, StatusCod
         error!("Failed to presign OSS URL: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, url)
+        .body(Body::empty())
+        .unwrap())
+}
+
+async fn serve_s3_redirect(state: &AppState, key: &str) -> Result<Response, StatusCode> {
+    let url = s3::presign_get_url(&state.config.storage.s3, key)
+        .await
+        .map_err(|e| {
+            error!("Failed to presign S3 URL: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Response::builder()
         .status(StatusCode::FOUND)

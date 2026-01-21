@@ -16,9 +16,9 @@ dir = "./cache"
 # 设为 0 表示只保留 tag 引用的版本（例如 stable/latest）
 max_versions = 10
 
-# Storage settings (local or oss)
+# Storage settings (local / oss / s3)
 [storage]
-# local 或 oss
+# local / oss / s3
 mode = "local"
 
 # OSS 配置（当 mode = "oss" 时生效）
@@ -35,6 +35,24 @@ prefix = ""
 https = true
 # 是否使用 path-style（https://endpoint/bucket/key）
 path_style = false
+# 预签名链接过期时间（秒）
+expires_seconds = 900
+
+# S3/R2 配置（当 mode = "s3" 时生效）
+[storage.s3]
+# R2 endpoint 例：https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+endpoint = ""
+bucket = ""
+access_key_id = ""
+secret_access_key = ""
+# 可选：STS 临时凭证
+# session_token = ""
+# R2 通常使用 "auto"
+region = "auto"
+# 可选：对象前缀，例如 "mirror"
+prefix = ""
+# R2 建议启用 path-style
+path_style = true
 # 预签名链接过期时间（秒）
 expires_seconds = 900
 

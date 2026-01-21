@@ -4,6 +4,7 @@ mod error;
 mod oss;
 mod providers;
 mod retry;
+mod s3;
 mod server;
 
 use anyhow::Result;
