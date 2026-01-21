@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "duckcoding-cli-installer"
-version = "0.1.6"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "clap",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "duckcoding-cli-mirror"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "aws-config",
