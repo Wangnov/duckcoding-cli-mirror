@@ -1,5 +1,8 @@
 name: node-runtime
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -89,6 +92,7 @@ jobs:
           fi
           echo "Resolved Node.js ${NODE_VERSION} from ${BASE_URL}"
           echo "NODE_VERSION=${NODE_VERSION}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=node-v${NODE_VERSION}" >> "$GITHUB_ENV"
 
           download() {
             local platform="$1"
@@ -165,6 +169,30 @@ jobs:
             JSON.stringify(result, null, 2)
           );
           NODE
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          rm -rf release
+          mkdir -p release
+          cp out/node/checksums.json release/
+          cp out/node/SHASUMS256.txt release/
+          find out/node -mindepth 2 -type f -print0 | while IFS= read -r -d '' file; do
+            base=$(basename "$file")
+            cp "$file" "release/${base}"
+          done
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --title "Node.js ${NODE_VERSION}" \
+              --notes "Node.js runtime assets for DuckCoding CLI Mirror."
+          fi
+          gh release upload "${RELEASE_TAG}" release/* --clobber
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

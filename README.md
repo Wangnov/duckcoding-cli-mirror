@@ -98,60 +98,28 @@ cargo build --release
 
 ### 服务端部署与缓存准备（不主动拉取 GitHub）
 
-为避免服务端向 GitHub 发起下载请求，以下三类缓存需要在部署时由运维**从本地/CI 拉取**并同步到服务器：
+installer/node/node-pty 现已统一改为 **GitHub Release 上游驱动**，服务端会主动从 Release 拉取并同步到 R2/OSS，
+无需再手动 rsync 到 `cache/`。
 
-- **installer**：由 release 构建产生（cargo-dist）
-- **node**：由 `node-runtime.yml` 构建产生
-- **node-pty**：由 `node-pty-prebuilds.yml` 构建产生
+推荐流程（发布到 Release 后由服务端拉取）：
 
-建议流程（在本地执行，服务器仅接收 rsync）：
+1) **node runtime**：触发 `node-runtime.yml`（workflow_dispatch）
+   - 自动创建/更新 Release：`node-v<version>`
+   - Release 资产包含：`checksums.json`、`SHASUMS256.txt`、各平台 `node-v*.tar.xz/zip`
 
-1) 触发 CI 并下载产物（示例）：
+2) **node-pty**：触发 `node-pty-prebuilds.yml`（workflow_dispatch）
+   - 自动创建/更新 Release：`node-pty-v<version>`
+   - Release 资产包含：`checksums.json`、`<platform>--pty.node`、`<platform>--spawn-helper`
 
-```bash
-# node runtime
-gh run list -w node-runtime.yml -L 1
-gh run download <RUN_ID> -D /tmp/node-runtime
+3) **installer**：正常走 cargo-dist 的 Release 流程（tag 触发，随后由 `installer-release-assets` 生成并补充 `checksums.json`）
 
-# node-pty
-gh run list -w node-pty-prebuilds.yml -L 1
-gh run download <RUN_ID> -D /tmp/node-pty
-
-# installer：从 GitHub Release 下载对应版本资产
-gh release download <TAG> -D /tmp/installer
-```
-
-2) 同步到服务器 cache（示例）：
+4) 让服务端更新缓存（可选）：
 
 ```bash
-# node
-rsync -av /tmp/node-runtime/node-<VERSION>-runtime/ \
-  <USER>@<SERVER>:/home/<USER>/duckcoding-cli-mirror/cache/node/versions/<VERSION>/
-
-# node-pty
-rsync -av /tmp/node-pty/node-pty-<VERSION>-prebuilds/ \
-  <USER>@<SERVER>:/home/<USER>/duckcoding-cli-mirror/cache/node-pty/versions/<VERSION>/
-
-# installer
-rsync -av /tmp/installer/ \
-  <USER>@<SERVER>:/home/<USER>/duckcoding-cli-mirror/cache/installer/versions/<VERSION>/
-```
-
-3) 写入 tag 并刷新缓存：
-
-```bash
-ssh <USER>@<SERVER> <<'EOF'
-set -e
-echo "<NODE_VERSION>" > /home/<USER>/duckcoding-cli-mirror/cache/node/tags/latest
-echo "<NODE_PTY_VERSION>" > /home/<USER>/duckcoding-cli-mirror/cache/node-pty/tags/latest
-echo "<INSTALLER_VERSION>" > /home/<USER>/duckcoding-cli-mirror/cache/installer/tags/latest
 curl -fsS -X POST http://127.0.0.1:1357/api/node/refresh
 curl -fsS -X POST http://127.0.0.1:1357/api/node-pty/refresh
 curl -fsS -X POST http://127.0.0.1:1357/api/installer/refresh
-EOF
 ```
-
-> 说明：服务端不会主动从 GitHub 拉取 installer/node/node-pty，部署时需保证这些缓存已被同步到 `cache/`。
 
 ### 配置文件
 

@@ -529,6 +529,12 @@ pub struct InstallerConfig {
     #[serde(default = "default_installer_tags")]
     pub tags: Vec<String>,
 
+    #[serde(default = "default_installer_repo")]
+    pub repo: String,
+
+    #[serde(default = "default_installer_include_prerelease")]
+    pub include_prerelease: bool,
+
     #[serde(default = "default_installer_platforms")]
     pub platforms: Vec<String>,
 }
@@ -538,6 +544,8 @@ impl Default for InstallerConfig {
         Self {
             enabled: default_installer_enabled(),
             tags: default_installer_tags(),
+            repo: default_installer_repo(),
+            include_prerelease: default_installer_include_prerelease(),
             platforms: default_installer_platforms(),
         }
     }
@@ -554,6 +562,18 @@ fn default_installer_tags() -> Vec<String> {
     vec!["latest".to_string()]
 }
 
+fn default_installer_repo() -> String {
+    std::env::var("MIRROR_INSTALLER_REPO")
+        .unwrap_or_else(|_| "Wangnov/duckcoding-cli-mirror".to_string())
+}
+
+fn default_installer_include_prerelease() -> bool {
+    std::env::var("MIRROR_INSTALLER_INCLUDE_PRERELEASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false)
+}
+
 fn default_installer_platforms() -> Vec<String> {
     default_codex_platforms()
 }
@@ -566,6 +586,12 @@ pub struct NodeConfig {
     #[serde(default = "default_node_tags")]
     pub tags: Vec<String>,
 
+    #[serde(default = "default_node_repo")]
+    pub repo: String,
+
+    #[serde(default = "default_node_include_prerelease")]
+    pub include_prerelease: bool,
+
     #[serde(default = "default_node_platforms")]
     pub platforms: Vec<String>,
 }
@@ -575,6 +601,8 @@ impl Default for NodeConfig {
         Self {
             enabled: default_node_enabled(),
             tags: default_node_tags(),
+            repo: default_node_repo(),
+            include_prerelease: default_node_include_prerelease(),
             platforms: default_node_platforms(),
         }
     }
@@ -589,6 +617,18 @@ fn default_node_enabled() -> bool {
 
 fn default_node_tags() -> Vec<String> {
     vec!["latest".to_string()]
+}
+
+fn default_node_repo() -> String {
+    std::env::var("MIRROR_NODE_REPO")
+        .unwrap_or_else(|_| "Wangnov/duckcoding-cli-mirror".to_string())
+}
+
+fn default_node_include_prerelease() -> bool {
+    std::env::var("MIRROR_NODE_INCLUDE_PRERELEASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false)
 }
 
 fn default_node_platforms() -> Vec<String> {
@@ -610,6 +650,12 @@ pub struct NodePtyConfig {
     #[serde(default = "default_node_pty_tags")]
     pub tags: Vec<String>,
 
+    #[serde(default = "default_node_pty_repo")]
+    pub repo: String,
+
+    #[serde(default = "default_node_pty_include_prerelease")]
+    pub include_prerelease: bool,
+
     #[serde(default = "default_node_pty_platforms")]
     pub platforms: Vec<String>,
 }
@@ -619,6 +665,8 @@ impl Default for NodePtyConfig {
         Self {
             enabled: default_node_pty_enabled(),
             tags: default_node_pty_tags(),
+            repo: default_node_pty_repo(),
+            include_prerelease: default_node_pty_include_prerelease(),
             platforms: default_node_pty_platforms(),
         }
     }
@@ -633,6 +681,18 @@ fn default_node_pty_enabled() -> bool {
 
 fn default_node_pty_tags() -> Vec<String> {
     vec!["latest".to_string()]
+}
+
+fn default_node_pty_repo() -> String {
+    std::env::var("MIRROR_NODE_PTY_REPO")
+        .unwrap_or_else(|_| "Wangnov/duckcoding-cli-mirror".to_string())
+}
+
+fn default_node_pty_include_prerelease() -> bool {
+    std::env::var("MIRROR_NODE_PTY_INCLUDE_PRERELEASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false)
 }
 
 fn default_node_pty_platforms() -> Vec<String> {

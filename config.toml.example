@@ -102,10 +102,12 @@ tags = ["stable", "latest"]
 include_prerelease = false
 repo = "google-gemini/gemini-cli"
 
-# Installer binary mirror configuration (local cache)
+# Installer binary mirror configuration (GitHub Release upstream)
 [installer]
 enabled = true
 tags = ["latest"]
+include_prerelease = false
+repo = "Wangnov/duckcoding-cli-mirror"
 platforms = [
     "darwin-x64",
     "darwin-arm64",
@@ -117,10 +119,12 @@ platforms = [
     "win32-arm64"
 ]
 
-# Node.js runtime mirror configuration (local cache)
+# Node.js runtime mirror configuration (GitHub Release upstream)
 [node]
 enabled = true
 tags = ["latest"]
+include_prerelease = false
+repo = "Wangnov/duckcoding-cli-mirror"
 platforms = [
     "darwin-x64",
     "darwin-arm64",
@@ -130,10 +134,12 @@ platforms = [
     "win32-arm64"
 ]
 
-# node-pty prebuilds mirror configuration (local cache)
+# node-pty prebuilds mirror configuration (GitHub Release upstream)
 [node_pty]
 enabled = true
 tags = ["latest"]
+include_prerelease = false
+repo = "Wangnov/duckcoding-cli-mirror"
 platforms = [
     "darwin-x64",
     "darwin-arm64",

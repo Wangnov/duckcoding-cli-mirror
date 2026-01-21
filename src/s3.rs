@@ -78,6 +78,7 @@ pub async fn put_bytes(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn get_object_bytes(config: &S3Config, object_key: &str) -> Result<Bytes> {
     let client = s3_client(config).await?;
     let key = object_key_with_prefix(config, object_key);

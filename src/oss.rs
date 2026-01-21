@@ -50,6 +50,7 @@ pub async fn put_bytes(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn get_object_bytes(config: &OssConfig, object_key: &str) -> Result<Bytes> {
     let client = oss_client(config)?;
     let key = object_key_with_prefix(config, object_key);

@@ -1,0 +1,63 @@
+name: installer-release-assets
+
+permissions:
+  contents: write
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to process"
+        required: true
+
+jobs:
+  checksums:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Generate checksums.json for installer release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TAG" ]; then
+            echo "TAG is required"
+            exit 1
+          fi
+
+          assets=$(gh release view "$TAG" --json assets -q '.assets[].name')
+          if ! echo "$assets" | grep -E -q '^duckcoding-cli-installer-.*\.(tar\.xz|zip)$'; then
+            echo "No installer assets found for ${TAG}, skipping."
+            exit 0
+          fi
+
+          work=$(mktemp -d)
+          mkdir -p "$work/assets"
+          gh release download "$TAG" \
+            -p "duckcoding-cli-installer-*.tar.xz" \
+            -p "duckcoding-cli-installer-*.zip" \
+            -p "duckcoding-cli-installer-*.tar.xz.sha256" \
+            -p "duckcoding-cli-installer-*.zip.sha256" \
+            -D "$work/assets"
+
+          python3 .github/scripts/prepare-installer-cache.py \
+            --assets-dir "$work/assets" \
+            --cache-dir "$work/cache" \
+            --version "$TAG"
+
+          checksums="$work/cache/installer/versions/$TAG/checksums.json"
+          if [ ! -f "$checksums" ]; then
+            echo "checksums.json not generated"
+            exit 1
+          fi
+
+          gh release upload "$TAG" "$checksums" --clobber

@@ -1,5 +1,8 @@
 name: node-pty-prebuilds
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -118,7 +121,8 @@ jobs:
               const hash = crypto.createHash('sha256').update(data).digest('hex');
               files[file] = {
                 sha256: hash,
-                size: fs.statSync(filePath).size
+                size: fs.statSync(filePath).size,
+                asset: `${platform}--${file}`
               };
             }
             result.platforms[platform] = { files };
@@ -129,6 +133,31 @@ jobs:
             JSON.stringify(result, null, 2)
           );
           NODE
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          rm -rf release
+          mkdir -p release
+          cp out/node-pty/checksums.json release/
+          find out/node-pty/prebuilds -mindepth 2 -type f -print0 | while IFS= read -r -d '' file; do
+            platform=$(basename "$(dirname "$file")")
+            base=$(basename "$file")
+            cp "$file" "release/${platform}--${base}"
+          done
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="node-pty-v${NODE_PTY_VERSION}"
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --title "node-pty ${NODE_PTY_VERSION}" \
+              --notes "node-pty prebuilds for DuckCoding CLI Mirror."
+          fi
+          gh release upload "${RELEASE_TAG}" release/* --clobber
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
