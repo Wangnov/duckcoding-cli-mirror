@@ -323,18 +323,27 @@ pub async fn upload_file(
 
     let upload_result = async {
         loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
+            let mut filled = 0usize;
+            while filled < PART_SIZE {
+                let read = file.read(&mut buffer[filled..]).await?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+
+            if filled == 0 {
                 break;
             }
-            let bytes = Bytes::copy_from_slice(&buffer[..read]);
+
+            let bytes = Bytes::copy_from_slice(&buffer[..filled]);
             let resp = client
                 .upload_part()
                 .bucket(&config.bucket)
                 .key(&key)
                 .upload_id(&upload_id)
                 .part_number(part_number)
-                .content_length(read as i64)
+                .content_length(filled as i64)
                 .body(ByteStream::from(bytes))
                 .send()
                 .await
@@ -346,7 +355,7 @@ pub async fn upload_file(
                 .context("Missing ETag from upload_part")?;
             completed_parts.push(UploadPartInfo { part_number, etag });
 
-            uploaded += read as u64;
+            uploaded += filled as u64;
             let speed = format_rate(uploaded, upload_started.elapsed());
             let pct = (uploaded as f64 / total_size as f64) * 100.0;
             debug!(
