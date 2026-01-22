@@ -25,16 +25,14 @@ pub fn strip_ansi(input: &str) -> String {
     let mut out = String::new();
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            if matches!(chars.peek(), Some('[')) {
-                chars.next();
-                while let Some(next) = chars.next() {
-                    if next == 'm' {
-                        break;
-                    }
+        if ch == '\x1b' && matches!(chars.peek(), Some('[')) {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
                 }
-                continue;
             }
+            continue;
         }
         out.push(ch);
     }
@@ -58,11 +56,7 @@ pub fn shimmer_text(
     let mut out = String::new();
     for seg in segments(input) {
         let i_pos = seg.pos + padding;
-        let dist = if i_pos >= wave_pos {
-            i_pos - wave_pos
-        } else {
-            wave_pos - i_pos
-        };
+        let dist = i_pos.abs_diff(wave_pos);
         if dist <= band_half_width && !colors.is_empty() {
             let idx = (dist * 2).min(colors.len().saturating_sub(1));
             let color = colors[idx];

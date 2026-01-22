@@ -12,6 +12,7 @@ use duckcoding_cli_mirror::{
         NodePtyProvider,
     },
     server::{self, AppState},
+    storage_clients::StorageClients,
 };
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
@@ -29,29 +30,77 @@ fn create_request(method: &str, uri: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn create_test_state() -> (TempDir, Arc<AppState>) {
+async fn create_test_state() -> (TempDir, Arc<AppState>) {
+    create_test_state_with(|_| {}).await
+}
+
+async fn create_test_state_with(apply: impl FnOnce(&mut Config)) -> (TempDir, Arc<AppState>) {
     let temp_dir = TempDir::new().unwrap();
     let mut config = Config::default();
     config.cache = CacheConfig {
         dir: temp_dir.path().to_path_buf(),
         max_versions: 3,
     };
+    apply(&mut config);
 
     let cache = CacheManager::new(&config.cache).unwrap();
     let cache = Arc::new(cache);
+    let storage_clients = StorageClients::new(&config.storage).await.unwrap();
     let storage = config.storage.clone();
-    let provider =
-        ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone(), storage.clone());
-    let codex = CodexProvider::new(config.codex.clone(), cache.clone(), storage.clone());
-    let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone(), storage.clone());
-    let installer =
-        InstallerProvider::new(config.installer.clone(), cache.clone(), storage.clone());
-    let node = NodeProvider::new(config.node.clone(), cache.clone(), storage.clone());
-    let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone(), storage);
+    let http = config.http.clone();
+    let provider = ClaudeCodeProvider::new(
+        config.claude_code.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )
+    .unwrap();
+    let codex = CodexProvider::new(
+        config.codex.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )
+    .unwrap();
+    let gemini = GeminiProvider::new(
+        config.gemini.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )
+    .unwrap();
+    let installer = InstallerProvider::new(
+        config.installer.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )
+    .unwrap();
+    let node = NodeProvider::new(
+        config.node.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )
+    .unwrap();
+    let node_pty = NodePtyProvider::new(
+        config.node_pty.clone(),
+        cache.clone(),
+        storage,
+        storage_clients.clone(),
+        http,
+    )
+    .unwrap();
 
     let state = Arc::new(AppState {
         config,
         cache,
+        storage_clients,
         claude_code: provider,
         codex,
         gemini,
@@ -59,6 +108,7 @@ fn create_test_state() -> (TempDir, Arc<AppState>) {
         node,
         node_pty,
         sync_lock: Mutex::new(()),
+        refresh_throttle: Mutex::new(std::collections::HashMap::new()),
     });
 
     (temp_dir, state)
@@ -67,7 +117,7 @@ fn create_test_state() -> (TempDir, Arc<AppState>) {
 /// Test health check endpoint
 #[tokio::test]
 async fn test_health_check() {
-    let (_temp_dir, state) = create_test_state();
+    let (_temp_dir, state) = create_test_state().await;
     let app = server::build_router(state);
 
     let response = app.oneshot(create_request("GET", "/health")).await.unwrap();
@@ -103,6 +153,77 @@ fn test_install_ps1_content() {
     assert!(script.contains("duckcoding-cli-installer.exe"));
 }
 
+#[tokio::test]
+async fn test_install_script_placeholder_injection_via_http() {
+    let (_temp_dir, state) = create_test_state_with(|config| {
+        config.server.public_url = Some("http://example.com".to_string());
+    })
+    .await;
+    let app = server::build_router(state);
+
+    let uris = [
+        "/claude-code/install.sh",
+        "/claude-code/install.ps1",
+        "/codex/install.sh",
+        "/codex/install.ps1",
+        "/gemini/install.sh",
+        "/gemini/install.ps1",
+    ];
+
+    for uri in uris {
+        let response = app
+            .clone()
+            .oneshot(create_request("GET", uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "uri={}", uri);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        if uri.ends_with(".sh") {
+            assert!(
+                text.contains(r#"MIRROR_URL="${MIRROR_URL:-http://example.com}""#),
+                "uri={} missing injected MIRROR_URL default",
+                uri
+            );
+            assert!(
+                !text.contains(r#"MIRROR_URL="${MIRROR_URL:-__MIRROR_URL__}""#),
+                "uri={} still contains un-injected MIRROR_URL default",
+                uri
+            );
+        } else if uri.ends_with(".ps1") {
+            assert!(
+                text.contains(r#"$MirrorUrl = "http://example.com""#),
+                "uri={} missing injected MirrorUrl default",
+                uri
+            );
+            assert!(
+                !text.contains(r#"$MirrorUrl = "__MIRROR_URL__""#),
+                "uri={} still contains un-injected MirrorUrl default",
+                uri
+            );
+        } else {
+            panic!("unexpected uri in test: {}", uri);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_install_script_requires_public_url() {
+    let (_temp_dir, state) = create_test_state_with(|config| {
+        config.server.public_url = None;
+    })
+    .await;
+    let app = server::build_router(state);
+
+    let response = app
+        .oneshot(create_request("GET", "/claude-code/install.sh"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[test]
 fn test_codex_install_sh_content() {
     let script = include_str!("../scripts/codex-install.sh");
@@ -125,8 +246,131 @@ fn test_codex_install_ps1_content() {
 }
 
 #[tokio::test]
+async fn test_claude_code_stable_fallback_to_latest() {
+    let (_temp_dir, state) = create_test_state().await;
+    let cache = state.cache.clone();
+
+    let version = "2.0.0-test";
+    cache
+        .write_tag("claude-code", "latest", version)
+        .await
+        .unwrap();
+
+    let app = server::build_router(state);
+    let response = app
+        .oneshot(create_request("GET", "/claude-code/stable"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], version.as_bytes());
+}
+
+#[tokio::test]
+async fn test_refresh_requires_token_when_not_configured() {
+    let (_temp_dir, state) = create_test_state_with(|config| {
+        config.server.refresh_token = None;
+    })
+    .await;
+    let app = server::build_router(state);
+
+    let response = app
+        .oneshot(create_request("POST", "/api/codex/refresh"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_refresh_with_token_succeeds_without_network() {
+    let (_temp_dir, state) = create_test_state_with(|config| {
+        config.server.refresh_token = Some("secret".to_string());
+        config.codex.enabled = false;
+    })
+    .await;
+    let app = server::build_router(state);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/codex/refresh")
+        .header("Authorization", "Bearer secret")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["success"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn test_refresh_throttling() {
+    let (_temp_dir, state) = create_test_state_with(|config| {
+        config.server.refresh_token = Some("secret".to_string());
+        config.server.refresh_min_interval_seconds = 60;
+        // Avoid making network calls.
+        config.codex.enabled = false;
+    })
+    .await;
+    let app = server::build_router(state);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/codex/refresh")
+        .header("Authorization", "Bearer secret")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/codex/refresh")
+        .header("Authorization", "Bearer secret")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_info_exposes_sync_status() {
+    let (_temp_dir, state) = create_test_state_with(|config| {
+        config.server.refresh_token = Some("secret".to_string());
+        // Avoid making network calls.
+        config.codex.enabled = false;
+    })
+    .await;
+    let app = server::build_router(state);
+
+    let refresh = Request::builder()
+        .method("POST")
+        .uri("/api/codex/refresh")
+        .header("Authorization", "Bearer secret")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(refresh).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(create_request("GET", "/api/codex/info"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["sync"].is_object());
+    assert!(json["sync"]["last_success_at"].is_string());
+    assert!(json["sync"]["last_duration_ms"].is_number());
+}
+
+#[tokio::test]
 async fn test_codex_tag_and_binary() {
-    let (_temp_dir, state) = create_test_state();
+    let (_temp_dir, state) = create_test_state().await;
     let cache = state.cache.clone();
 
     let version = "rust-v0.0.0-test";
@@ -200,8 +444,66 @@ async fn test_codex_tag_and_binary() {
 }
 
 #[tokio::test]
+async fn test_local_download_supports_range_requests() {
+    let (_temp_dir, state) = create_test_state().await;
+    let cache = state.cache.clone();
+
+    let version = "rust-v0.0.2-range";
+    let platform = "linux-x64";
+    let filename = "codex-x86_64-unknown-linux-gnu.tar.gz";
+    let data = b"0123456789abcdef";
+
+    let path = cache.binary_path("codex", version, platform, filename);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.unwrap();
+    }
+    tokio::fs::write(&path, data).await.unwrap();
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let sha256 = hex::encode(hasher.finalize());
+
+    cache
+        .update_provider_metadata("codex", |m| {
+            m.versions.insert(
+                version.to_string(),
+                VersionMetadata {
+                    version: version.to_string(),
+                    downloaded_at: chrono::Utc::now(),
+                    platforms: [(
+                        platform.to_string(),
+                        PlatformMetadata {
+                            sha256,
+                            size: data.len() as u64,
+                            filename: filename.to_string(),
+                            files: std::collections::HashMap::new(),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            );
+        })
+        .await
+        .unwrap();
+
+    let app = server::build_router(state);
+    let request = Request::builder()
+        .method("GET")
+        .uri(&format!("/codex/{}/{}/{}", version, platform, filename))
+        .header("Range", "bytes=0-3")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], &data[..4]);
+}
+
+#[tokio::test]
 async fn test_codex_checksums_api() {
-    let (_temp_dir, state) = create_test_state();
+    let (_temp_dir, state) = create_test_state().await;
     let cache = state.cache.clone();
 
     let version = "rust-v0.0.1-test";

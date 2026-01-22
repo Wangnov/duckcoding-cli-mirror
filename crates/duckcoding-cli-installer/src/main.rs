@@ -458,20 +458,16 @@ fn install_gemini(ctx: &InstallContext, args: GeminiArgs) -> Result<()> {
 
     if args.common.check {
         report_check(&ui, installed_gemini.as_deref(), &version);
-        if installed_node.is_some() {
-            ui.success(&format!(
-                "{}: {}",
-                tr("node_installed"),
-                installed_node.unwrap()
-            ));
+        if let Some(installed_node) = installed_node.as_deref() {
+            ui.success(&format!("{}: {}", tr("node_installed"), installed_node));
         } else {
             ui.info(tr("node_missing"));
         }
-        if installed_node_pty.is_some() {
+        if let Some(installed_node_pty) = installed_node_pty.as_deref() {
             ui.success(&format!(
                 "{}: {}",
                 tr("node_pty_installed"),
-                installed_node_pty.unwrap()
+                installed_node_pty
             ));
         } else {
             ui.info(tr("node_pty_missing"));
@@ -527,6 +523,7 @@ fn install_gemini(ctx: &InstallContext, args: GeminiArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_node(
     ctx: &InstallContext,
     node_platform: &str,
@@ -695,6 +692,7 @@ fn install_node_pty(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_gemini_js(
     ctx: &InstallContext,
     version: &str,
@@ -729,7 +727,7 @@ fn install_gemini_js(
     let tmp = NamedTempFile::new_in(&gemini_dir)?;
     let label = ui.label_downloading("Gemini CLI");
     let download = download_with_progress(ctx, &url, tmp.path(), meta.size, &label, ui)?;
-    run_with_spinner(&ui, tr("verifying"), || {
+    run_with_spinner(ui, tr("verifying"), || {
         verify_sha256(&download.sha256, &meta.sha256)
     })?;
 

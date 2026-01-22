@@ -19,6 +19,10 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 use crate::config::S3Config;
+use crate::progress::{format_bytes, format_rate, progress_log_interval};
+
+const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
+const PART_SIZE: usize = 5 * 1024 * 1024;
 
 pub struct UploadResult {
     pub size: u64,
@@ -43,7 +47,15 @@ enum ETagPolicy {
 }
 
 pub async fn presign_get_url(config: &S3Config, object_key: &str) -> Result<String> {
-    let client = s3_client(config).await?;
+    let client = build_client(config).await?;
+    presign_get_url_with_client(&client, config, object_key).await
+}
+
+pub async fn presign_get_url_with_client(
+    client: &Client,
+    config: &S3Config,
+    object_key: &str,
+) -> Result<String> {
     let key = object_key_with_prefix(config, object_key);
     let presign = PresigningConfig::expires_in(Duration::from_secs(config.expires_seconds))
         .context("Failed to create presign config")?;
@@ -63,7 +75,17 @@ pub async fn put_bytes(
     content_type: &str,
     body: Vec<u8>,
 ) -> Result<()> {
-    let client = s3_client(config).await?;
+    let client = build_client(config).await?;
+    put_bytes_with_client(&client, config, object_key, content_type, body).await
+}
+
+pub async fn put_bytes_with_client(
+    client: &Client,
+    config: &S3Config,
+    object_key: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<()> {
     let key = object_key_with_prefix(config, object_key);
     let stream = ByteStream::from(body);
     client
@@ -80,7 +102,15 @@ pub async fn put_bytes(
 
 #[allow(dead_code)]
 pub async fn get_object_bytes(config: &S3Config, object_key: &str) -> Result<Bytes> {
-    let client = s3_client(config).await?;
+    let client = build_client(config).await?;
+    get_object_bytes_with_client(&client, config, object_key).await
+}
+
+pub async fn get_object_bytes_with_client(
+    client: &Client,
+    config: &S3Config,
+    object_key: &str,
+) -> Result<Bytes> {
     let key = object_key_with_prefix(config, object_key);
     let response = client
         .get_object()
@@ -101,7 +131,15 @@ pub async fn head_object_info(
     config: &S3Config,
     object_key: &str,
 ) -> Result<Option<HeadObjectInfo>> {
-    let client = s3_client(config).await?;
+    let client = build_client(config).await?;
+    head_object_info_with_client(&client, config, object_key).await
+}
+
+pub async fn head_object_info_with_client(
+    client: &Client,
+    config: &S3Config,
+    object_key: &str,
+) -> Result<Option<HeadObjectInfo>> {
     let key = object_key_with_prefix(config, object_key);
     let result = client
         .head_object()
@@ -115,7 +153,7 @@ pub async fn head_object_info(
             let size = output
                 .content_length()
                 .and_then(|value| if value >= 0 { Some(value as u64) } else { None });
-            let sha256 = output.metadata().and_then(|meta| extract_sha256_meta(meta));
+            let sha256 = output.metadata().and_then(extract_sha256_meta);
             Ok(Some(HeadObjectInfo { size, sha256 }))
         }
         Err(err) => {
@@ -130,6 +168,29 @@ pub async fn head_object_info(
 }
 
 pub async fn upload_stream<S>(
+    config: &S3Config,
+    object_key: &str,
+    content_type: &str,
+    total_size: Option<u64>,
+    stream: S,
+) -> Result<UploadResult>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
+{
+    let client = build_client(config).await?;
+    upload_stream_with_client(
+        &client,
+        config,
+        object_key,
+        content_type,
+        total_size,
+        stream,
+    )
+    .await
+}
+
+pub async fn upload_stream_with_client<S>(
+    client: &Client,
     config: &S3Config,
     object_key: &str,
     content_type: &str,
@@ -211,7 +272,8 @@ where
 
     info!("Uploading to S3 object {}", object_key);
     let upload_started = Instant::now();
-    let upload_result = match upload_file(
+    let upload_result = match upload_file_with_client(
+        client,
         config,
         object_key,
         content_type,
@@ -238,7 +300,15 @@ where
 }
 
 pub async fn delete_object(config: &S3Config, object_key: &str) -> Result<()> {
-    let client = s3_client(config).await?;
+    let client = build_client(config).await?;
+    delete_object_with_client(&client, config, object_key).await
+}
+
+pub async fn delete_object_with_client(
+    client: &Client,
+    config: &S3Config,
+    object_key: &str,
+) -> Result<()> {
     let key = object_key_with_prefix(config, object_key);
     client
         .delete_object()
@@ -257,10 +327,18 @@ pub async fn upload_file(
     path: &PathBuf,
     sha256: Option<&str>,
 ) -> Result<()> {
-    const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
-    const PART_SIZE: usize = 5 * 1024 * 1024;
+    let client = build_client(config).await?;
+    upload_file_with_client(&client, config, object_key, content_type, path, sha256).await
+}
 
-    let client = s3_client(config).await?;
+pub async fn upload_file_with_client(
+    client: &Client,
+    config: &S3Config,
+    object_key: &str,
+    content_type: &str,
+    path: &PathBuf,
+    sha256: Option<&str>,
+) -> Result<()> {
     let key = object_key_with_prefix(config, object_key);
     let total_size = tokio::fs::metadata(path)
         .await
@@ -372,7 +450,7 @@ pub async fn upload_file(
         }
 
         let complete_result = complete_multipart_upload_with_policy(
-            &client,
+            client,
             &config.bucket,
             &key,
             &upload_id,
@@ -394,7 +472,7 @@ pub async fn upload_file(
 
             if retry_needed {
                 let retry = complete_multipart_upload_with_policy(
-                    &client,
+                    client,
                     &config.bucket,
                     &key,
                     &upload_id,
@@ -568,53 +646,6 @@ fn normalize_endpoint(endpoint: &str) -> String {
     }
 }
 
-fn progress_log_interval(total_size: Option<u64>) -> u64 {
-    let max_interval = 5 * 1024 * 1024;
-    let min_interval = 512 * 1024;
-    match total_size {
-        Some(total) if total > 0 => {
-            let by_percent = total / 20;
-            let mut interval = by_percent.clamp(min_interval, max_interval);
-            if total < min_interval {
-                interval = total;
-            }
-            if interval == 0 {
-                interval = min_interval;
-            }
-            interval
-        }
-        _ => max_interval,
-    }
-}
-
-fn format_rate(bytes: u64, elapsed: Duration) -> String {
-    let secs = elapsed.as_secs_f64();
-    if secs <= 0.0 {
-        return "0 B/s".to_string();
-    }
-    let per_sec = (bytes as f64 / secs).round().max(0.0) as u64;
-    format!("{}/s", format_bytes(per_sec))
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut idx = 0usize;
-    while size >= 1024.0 && idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        idx += 1;
-    }
-    if idx == 0 {
-        format!("{} {}", bytes, UNITS[idx])
-    } else if size >= 100.0 {
-        format!("{:.0} {}", size, UNITS[idx])
-    } else if size >= 10.0 {
-        format!("{:.1} {}", size, UNITS[idx])
-    } else {
-        format!("{:.2} {}", size, UNITS[idx])
-    }
-}
-
 async fn s3_client(config: &S3Config) -> Result<Client> {
     validate_config(config)?;
 
@@ -640,4 +671,8 @@ async fn s3_client(config: &S3Config) -> Result<Client> {
     }
 
     Ok(Client::from_conf(builder.build()))
+}
+
+pub async fn build_client(config: &S3Config) -> Result<Client> {
+    s3_client(config).await
 }

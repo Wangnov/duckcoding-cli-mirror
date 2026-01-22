@@ -1,6 +1,7 @@
 pub mod claude_code;
 pub mod codex;
 pub mod gemini;
+pub mod github;
 pub mod installer;
 pub mod node;
 pub mod node_pty;

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -31,12 +31,28 @@ pub struct FileMetadata {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderSyncStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 /// Provider-specific metadata
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMetadata {
     pub tags: HashMap<String, String>, // tag -> version
     pub versions: HashMap<String, VersionMetadata>,
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub sync: ProviderSyncStatus,
 }
 
 /// Global cache metadata
@@ -73,7 +89,34 @@ impl CacheManager {
         let metadata_path = config.dir.join("metadata.json");
         let metadata = if metadata_path.exists() {
             let content = std::fs::read_to_string(&metadata_path)?;
-            serde_json::from_str(&content).unwrap_or_default()
+            match serde_json::from_str(&content) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to parse {}: {}; starting with empty metadata",
+                        metadata_path.display(),
+                        err
+                    );
+
+                    // Best-effort backup for debugging.
+                    let backup_path = metadata_path
+                        .with_file_name(format!("metadata.json.bak-{}", Utc::now().timestamp()));
+                    if let Err(e) = std::fs::rename(&metadata_path, &backup_path) {
+                        tracing::warn!(
+                            "Failed to backup invalid metadata.json to {}: {}",
+                            backup_path.display(),
+                            e
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Backed up invalid metadata.json to {}",
+                            backup_path.display()
+                        );
+                    }
+
+                    CacheMetadata::default()
+                }
+            }
         } else {
             CacheMetadata::default()
         };
@@ -114,6 +157,9 @@ impl CacheManager {
 
     /// Read a tag to get version
     pub async fn read_tag(&self, provider: &str, tag: &str) -> Option<String> {
+        if !is_safe_tag(tag) {
+            return None;
+        }
         let path = self.tag_path(provider, tag);
         tokio::fs::read_to_string(&path)
             .await
@@ -123,6 +169,9 @@ impl CacheManager {
 
     /// Write a tag
     pub async fn write_tag(&self, provider: &str, tag: &str, version: &str) -> Result<()> {
+        if !is_safe_tag(tag) {
+            anyhow::bail!("Invalid tag name: {}", tag);
+        }
         let path = self.tag_path(provider, tag);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -146,6 +195,24 @@ impl CacheManager {
     /// Read metadata
     pub async fn get_metadata(&self) -> CacheMetadata {
         self.metadata.read().await.clone()
+    }
+
+    pub async fn with_provider_metadata<R>(
+        &self,
+        provider: &str,
+        f: impl FnOnce(&ProviderMetadata) -> R,
+    ) -> Option<R> {
+        let metadata = self.metadata.read().await;
+        let provider_metadata = match provider {
+            "claude-code" => &metadata.claude_code,
+            "codex" => &metadata.codex,
+            "gemini" => &metadata.gemini,
+            "installer" => &metadata.installer,
+            "node" => &metadata.node,
+            "node-pty" => &metadata.node_pty,
+            _ => return None,
+        };
+        Some(f(provider_metadata))
     }
 
     /// Update metadata for a provider
@@ -173,7 +240,7 @@ impl CacheManager {
 
         // Save to disk without holding the lock across await.
         let metadata_path = self.config.dir.join("metadata.json");
-        tokio::fs::write(&metadata_path, content).await?;
+        write_file_atomic(&metadata_path, content.as_bytes()).await?;
 
         Ok(())
     }
@@ -194,10 +261,6 @@ impl CacheManager {
 
     /// Clean up old versions, keeping only max_versions
     pub async fn cleanup_old_versions(&self, provider: &str) -> Result<Vec<VersionMetadata>> {
-        if provider == "installer" {
-            return self.cleanup_installer_latest().await;
-        }
-
         let max_versions = self.config.max_versions;
 
         let (versions_to_remove, removed_metadata) = {
@@ -206,6 +269,7 @@ impl CacheManager {
                 "claude-code" => &metadata.claude_code,
                 "codex" => &metadata.codex,
                 "gemini" => &metadata.gemini,
+                "installer" => &metadata.installer,
                 "node" => &metadata.node,
                 "node-pty" => &metadata.node_pty,
                 _ => return Ok(Vec::new()),
@@ -276,6 +340,7 @@ impl CacheManager {
                 "claude-code" => &mut metadata.claude_code,
                 "codex" => &mut metadata.codex,
                 "gemini" => &mut metadata.gemini,
+                "installer" => &mut metadata.installer,
                 "node" => &mut metadata.node,
                 "node-pty" => &mut metadata.node_pty,
                 _ => return Ok(Vec::new()),
@@ -289,71 +354,15 @@ impl CacheManager {
         };
 
         let metadata_path = self.config.dir.join("metadata.json");
-        tokio::fs::write(&metadata_path, content).await?;
+        write_file_atomic(&metadata_path, content.as_bytes()).await?;
 
         Ok(removed_metadata)
     }
 
-    async fn cleanup_installer_latest(&self) -> Result<Vec<VersionMetadata>> {
-        let (versions_to_remove, removed_metadata) = {
-            let metadata = self.metadata.read().await;
-            let Some(latest) = metadata.installer.tags.get("latest") else {
-                tracing::warn!("Installer latest tag not set; skip cleanup");
-                return Ok(Vec::new());
-            };
-
-            let versions_to_remove = metadata
-                .installer
-                .versions
-                .keys()
-                .filter(|version| *version != latest)
-                .cloned()
-                .collect::<Vec<String>>();
-
-            let removed_metadata = versions_to_remove
-                .iter()
-                .filter_map(|version| metadata.installer.versions.get(version).cloned())
-                .collect::<Vec<VersionMetadata>>();
-
-            (versions_to_remove, removed_metadata)
-        };
-
-        if versions_to_remove.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        for version in &versions_to_remove {
-            let version_path = self.version_path("installer", version);
-            if version_path.exists() {
-                if let Err(e) = tokio::fs::remove_dir_all(&version_path).await {
-                    tracing::warn!(
-                        "Failed to delete version directory {}: {}",
-                        version_path.display(),
-                        e
-                    );
-                } else {
-                    tracing::info!("Deleted old version: installer/{}", version);
-                }
-            }
-        }
-
-        let content = {
-            let mut metadata = self.metadata.write().await;
-            let provider_metadata = &mut metadata.installer;
-            for version in &versions_to_remove {
-                provider_metadata.versions.remove(version);
-            }
-
-            serde_json::to_string_pretty(&*metadata)?
-        };
-
-        let metadata_path = self.config.dir.join("metadata.json");
-        tokio::fs::write(&metadata_path, content).await?;
-
-        Ok(removed_metadata)
-    }
-
-    /// Get file path for serving
+    /// Build a safe local filesystem path under the provider directory.
+    ///
+    /// Note: this does *not* check whether the path exists. Callers that need an
+    /// existence check should do it explicitly.
     pub fn get_file_path(&self, provider: &str, path_segments: &[&str]) -> Option<PathBuf> {
         let base = self.provider_path(provider);
         let mut result = base;
@@ -364,7 +373,7 @@ impl CacheManager {
             }
             result = result.join(segment);
         }
-        if result.exists() { Some(result) } else { None }
+        Some(result)
     }
 
     /// Build object key for storage backend (without checking existence)
@@ -382,6 +391,41 @@ impl CacheManager {
         }
         Some(key)
     }
+}
+
+async fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Path has no parent: {}", path.display()))?;
+    tokio::fs::create_dir_all(parent).await?;
+
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let tmp_path = parent.join(format!(
+        ".{}.tmp-{}",
+        filename,
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+
+    tokio::fs::write(&tmp_path, bytes).await?;
+
+    if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
+        // Windows doesn't allow rename-over-existing; retry with delete.
+        tracing::debug!("rename failed for {}: {}", path.display(), err);
+        let _ = tokio::fs::remove_file(path).await;
+        tokio::fs::rename(&tmp_path, path).await?;
+    }
+
+    Ok(())
+}
+
+fn is_safe_tag(tag: &str) -> bool {
+    if tag.is_empty() {
+        return false;
+    }
+    if tag.contains("..") || tag.contains('/') || tag.contains('\\') {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -472,6 +516,24 @@ mod tests {
                 .is_none()
         );
         assert!(cache.get_file_path("claude-code", &["foo/bar"]).is_none());
+    }
+
+    #[test]
+    fn test_get_file_path_returns_path_even_if_missing() {
+        let (temp_dir, cache) = create_test_cache();
+
+        let path = cache
+            .get_file_path("claude-code", &["versions", "1.0.0", "manifest.json"])
+            .unwrap();
+        assert_eq!(
+            path,
+            temp_dir
+                .path()
+                .join("claude-code")
+                .join("versions")
+                .join("1.0.0")
+                .join("manifest.json")
+        );
     }
 
     #[tokio::test]

@@ -1,16 +1,8 @@
-mod cache;
-mod config;
-mod error;
-mod oss;
-mod providers;
-mod retry;
-mod s3;
-mod server;
-
 use anyhow::Result;
 use clap::Parser;
+use duckcoding_cli_mirror::{cache, config, server};
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -63,17 +55,24 @@ async fn main() -> Result<()> {
         config.server.host, config.server.port
     );
 
-    // Initialize cache manager
-    let cache_manager = cache::CacheManager::new(&config.cache)?;
-
     // Optionally refresh cache on startup
+    let mut skip_initial_sync = false;
     if args.refresh {
         info!("Refreshing cache on startup...");
-        // TODO: Implement refresh
+        let refresh_cache = cache::CacheManager::new(&config.cache)?;
+        match server::sync_once(config.clone(), refresh_cache).await {
+            Ok(()) => skip_initial_sync = true,
+            Err(e) => {
+                error!("Refresh failed, continuing with normal startup: {}", e);
+            }
+        }
     }
 
+    // Initialize cache manager for server runtime
+    let cache_manager = cache::CacheManager::new(&config.cache)?;
+
     // Start the HTTP server
-    server::run(config, cache_manager).await?;
+    server::run(config, cache_manager, skip_initial_sync).await?;
 
     Ok(())
 }

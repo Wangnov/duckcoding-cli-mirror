@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 use crate::config::OssConfig;
+use crate::progress::{format_bytes, format_rate, progress_log_interval};
 
 type HmacSha1 = Hmac<Sha1>;
 const APPEND_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -29,7 +30,17 @@ pub async fn put_bytes(
     content_type: &str,
     body: Vec<u8>,
 ) -> Result<()> {
-    let client = oss_client(config)?;
+    let client = build_client(config)?;
+    put_bytes_with_client(&client, config, object_key, content_type, body).await
+}
+
+pub async fn put_bytes_with_client(
+    client: &OSS<'_>,
+    config: &OssConfig,
+    object_key: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<()> {
     let key = object_key_with_prefix(config, object_key);
     let headers = content_type_headers(content_type);
     client
@@ -52,7 +63,7 @@ pub async fn put_bytes(
 
 #[allow(dead_code)]
 pub async fn get_object_bytes(config: &OssConfig, object_key: &str) -> Result<Bytes> {
-    let client = oss_client(config)?;
+    let client = build_client(config)?;
     let key = object_key_with_prefix(config, object_key);
     let content = client
         .get_object(
@@ -72,6 +83,29 @@ pub async fn get_object_bytes(config: &OssConfig, object_key: &str) -> Result<By
 }
 
 pub async fn upload_stream<S>(
+    config: &OssConfig,
+    object_key: &str,
+    content_type: &str,
+    total_size: Option<u64>,
+    stream: S,
+) -> Result<UploadResult>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
+{
+    let client = build_client(config)?;
+    upload_stream_with_client(
+        &client,
+        config,
+        object_key,
+        content_type,
+        total_size,
+        stream,
+    )
+    .await
+}
+
+pub async fn upload_stream_with_client<S>(
+    client: &OSS<'_>,
     config: &OssConfig,
     object_key: &str,
     content_type: &str,
@@ -153,13 +187,14 @@ where
 
     info!("Uploading to OSS object {}", object_key);
     let upload_started = Instant::now();
-    let upload_result = match upload_file(config, object_key, content_type, &temp_path).await {
-        Ok(()) => upload_result,
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(err);
-        }
-    };
+    let upload_result =
+        match upload_file_with_client(client, config, object_key, content_type, &temp_path).await {
+            Ok(()) => upload_result,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(err);
+            }
+        };
 
     let _ = tokio::fs::remove_file(&temp_path).await;
     info!(
@@ -172,7 +207,15 @@ where
 }
 
 pub async fn delete_object(config: &OssConfig, object_key: &str) -> Result<()> {
-    let client = oss_client(config)?;
+    let client = build_client(config)?;
+    delete_object_with_client(&client, config, object_key).await
+}
+
+pub async fn delete_object_with_client(
+    client: &OSS<'_>,
+    config: &OssConfig,
+    object_key: &str,
+) -> Result<()> {
     let key = object_key_with_prefix(config, object_key);
     client.delete_object(key).await.map_err(|err| {
         anyhow::anyhow!(
@@ -190,9 +233,19 @@ pub async fn upload_file(
     content_type: &str,
     path: &PathBuf,
 ) -> Result<()> {
-    let client = oss_client(config)?;
+    let client = build_client(config)?;
+    upload_file_with_client(&client, config, object_key, content_type, path).await
+}
+
+pub async fn upload_file_with_client(
+    client: &OSS<'_>,
+    config: &OssConfig,
+    object_key: &str,
+    content_type: &str,
+    path: &PathBuf,
+) -> Result<()> {
     let key = object_key_with_prefix(config, object_key);
-    ensure_object_absent(&client, &key).await?;
+    ensure_object_absent(client, &key).await?;
 
     let total_size = tokio::fs::metadata(path)
         .await
@@ -203,7 +256,8 @@ pub async fn upload_file(
     let mut buffer = vec![0u8; APPEND_CHUNK_SIZE];
     let mut uploaded: u64 = 0;
     let mut last_logged: u64 = 0;
-    const LOG_EVERY_BYTES: u64 = 64 * 1024 * 1024;
+    let log_every_bytes = progress_log_interval(Some(total_size));
+    let upload_started = Instant::now();
 
     loop {
         let read = file.read(&mut buffer).await?;
@@ -211,19 +265,39 @@ pub async fn upload_file(
             break;
         }
 
-        position = append_chunk(&client, &key, content_type, position, &buffer[..read]).await?;
+        position = append_chunk(client, &key, content_type, position, &buffer[..read]).await?;
         uploaded += read as u64;
-        if uploaded.saturating_sub(last_logged) >= LOG_EVERY_BYTES {
-            info!(
-                "Uploading OSS object {} ({} / {} bytes)",
-                object_key, uploaded, total_size
-            );
+        if uploaded.saturating_sub(last_logged) >= log_every_bytes {
+            let speed = format_rate(uploaded, upload_started.elapsed());
+            if total_size > 0 {
+                let pct = (uploaded as f64 / total_size as f64) * 100.0;
+                debug!(
+                    "Uploaded {}/{} ({:.1}%), {} for OSS object {}",
+                    format_bytes(uploaded),
+                    format_bytes(total_size),
+                    pct.min(100.0),
+                    speed,
+                    object_key
+                );
+            } else {
+                debug!(
+                    "Uploaded {} ({}) for OSS object {}",
+                    format_bytes(uploaded),
+                    speed,
+                    object_key
+                );
+            }
             last_logged = uploaded;
         }
     }
 
     if total_size > 0 {
-        info!("Finished OSS upload {} ({} bytes)", object_key, total_size);
+        info!(
+            "Finished OSS upload {} ({} bytes) in {:?}",
+            object_key,
+            total_size,
+            upload_started.elapsed()
+        );
     }
 
     Ok(())
@@ -266,53 +340,6 @@ fn temp_path_for(object_key: &str) -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("dc-mirror-{}-{}.tmp", name, ts)))
 }
 
-fn progress_log_interval(total_size: Option<u64>) -> u64 {
-    let max_interval = 5 * 1024 * 1024;
-    let min_interval = 512 * 1024;
-    match total_size {
-        Some(total) if total > 0 => {
-            let by_percent = total / 20;
-            let mut interval = by_percent.clamp(min_interval, max_interval);
-            if total < min_interval {
-                interval = total;
-            }
-            if interval == 0 {
-                interval = min_interval;
-            }
-            interval
-        }
-        _ => max_interval,
-    }
-}
-
-fn format_rate(bytes: u64, elapsed: Duration) -> String {
-    let secs = elapsed.as_secs_f64();
-    if secs <= 0.0 {
-        return "0 B/s".to_string();
-    }
-    let per_sec = (bytes as f64 / secs).round().max(0.0) as u64;
-    format!("{}/s", format_bytes(per_sec))
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut idx = 0usize;
-    while size >= 1024.0 && idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        idx += 1;
-    }
-    if idx == 0 {
-        format!("{} {}", bytes, UNITS[idx])
-    } else if size >= 100.0 {
-        format!("{:.0} {}", size, UNITS[idx])
-    } else if size >= 10.0 {
-        format!("{:.1} {}", size, UNITS[idx])
-    } else {
-        format!("{:.2} {}", size, UNITS[idx])
-    }
-}
-
 fn object_key_with_prefix(config: &OssConfig, object_key: &str) -> String {
     join_prefix(&config.prefix, object_key)
 }
@@ -334,6 +361,10 @@ fn oss_client(config: &OssConfig) -> Result<OSS<'static>> {
         endpoint,
         config.bucket.clone(),
     ))
+}
+
+pub fn build_client(config: &OssConfig) -> Result<OSS<'static>> {
+    oss_client(config)
 }
 
 fn normalize_endpoint(config: &OssConfig) -> String {

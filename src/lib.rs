@@ -1,8 +1,11 @@
 pub mod cache;
 pub mod config;
 pub mod error;
+pub mod http_client;
 pub mod oss;
+pub mod progress;
 pub mod providers;
 pub mod retry;
 pub mod s3;
 pub mod server;
+pub mod storage_clients;

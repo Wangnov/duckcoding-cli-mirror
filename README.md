@@ -9,8 +9,9 @@
 | **Claude Code** | Google Cloud Storage | Anthropic 官方 CLI |
 | **Codex** | GitHub Releases | OpenAI 官方 CLI |
 | **Gemini CLI** | GitHub Releases | Google 官方 CLI |
-| **Node.js** | 从官方拉取后缓存 | Gemini CLI 私有运行时 |
-| **node-pty** | CI预构建后缓存 | 终端模拟预编译库 |
+| **Installer** | GitHub Releases | 安装器二进制 |
+| **Node.js** | GitHub Releases（本仓库） | Gemini CLI 私有运行时 |
+| **node-pty** | GitHub Releases（本仓库） | 终端模拟预编译库 |
 
 ## 快速开始
 
@@ -52,8 +53,11 @@ irm https://mirror.duckcoding.com/gemini/install.ps1 | iex
 # 安装指定版本
 curl -fsSL .../install.sh | bash -s -- --version 2.0.67
 
-# 安装指定标签 (stable/latest)
+# 安装指定标签 (stable/latest/custom)
 curl -fsSL .../install.sh | bash -s -- --tag stable
+
+# 安装自定义标签（需在服务端配置 tags）
+curl -fsSL .../install.sh | bash -s -- --tag my-tag
 
 # 强制升级（即使已是最新版本）
 curl -fsSL .../install.sh | bash -s -- --upgrade
@@ -96,7 +100,7 @@ cargo build --release
 ./target/release/duckcoding-cli-mirror --config config.toml
 ```
 
-### 服务端部署与缓存准备（不主动拉取 GitHub）
+### 服务端部署与缓存准备（Release 上游驱动）
 
 installer/node/node-pty 现已统一改为 **GitHub Release 上游驱动**，服务端会主动从 Release 拉取并同步到 R2/OSS，
 无需再手动 rsync 到 `cache/`。
@@ -116,9 +120,11 @@ installer/node/node-pty 现已统一改为 **GitHub Release 上游驱动**，服
 4) 让服务端更新缓存（可选）：
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:1357/api/node/refresh
-curl -fsS -X POST http://127.0.0.1:1357/api/node-pty/refresh
-curl -fsS -X POST http://127.0.0.1:1357/api/installer/refresh
+# 注意：refresh 接口需要配置 server.refresh_token（或环境变量 MIRROR_REFRESH_TOKEN）
+# 然后带上 Authorization: Bearer
+curl -fsS -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:1357/api/node/refresh
+curl -fsS -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:1357/api/node-pty/refresh
+curl -fsS -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:1357/api/installer/refresh
 ```
 
 ### 配置文件
@@ -137,6 +143,13 @@ port = 1357
 host = "0.0.0.0"
 # 必须配置：安装脚本中使用的公开地址
 public_url = "https://mirror.duckcoding.com"
+# 可选：refresh 接口鉴权/节流
+# refresh_token = "replace-with-a-strong-random-token"
+# refresh_min_interval_seconds = 10  # 0 表示禁用节流
+
+[http]
+connect_timeout_seconds = 10   # 连接超时
+request_timeout_seconds = 3600 # 请求总超时（0 表示不限制）
 
 [cache]
 dir = "./cache"
@@ -145,6 +158,9 @@ max_versions = 10      # 保留的历史版本数
 [update]
 interval_minutes = 10  # 自动更新检查间隔
 enabled = true
+
+[codex]
+tags = ["stable", "latest", "my-tag"]  # 自定义 tag 支持
 ```
 
 ### 环境变量
@@ -156,6 +172,10 @@ enabled = true
 | `MIRROR_PUBLIC_URL` | 公开访问地址 | - |
 | `MIRROR_CACHE_DIR` | 缓存目录 | ./cache |
 | `MIRROR_UPDATE_INTERVAL` | 更新间隔（分钟） | 10 |
+| `MIRROR_HTTP_CONNECT_TIMEOUT` | 连接超时（秒） | 10 |
+| `MIRROR_HTTP_TIMEOUT` | 请求总超时（秒） | 3600 |
+| `MIRROR_REFRESH_TOKEN` | 刷新接口 Token（POST /api/*/refresh，需要 Authorization: Bearer） | - |
+| `MIRROR_REFRESH_MIN_INTERVAL` | refresh 接口节流间隔（秒，0 表示禁用） | 10 |
 | `GITHUB_TOKEN` | GitHub API Token | - |
 
 ## API 文档
@@ -163,7 +183,7 @@ enabled = true
 ### 版本信息
 
 ```
-GET /{tool}/{tag}          # 获取版本号 (stable/latest)
+GET /{tool}/{tag}          # 获取版本号（支持自定义 tag；需在配置中启用）
 GET /{tool}/{version}/...  # 下载指定版本
 ```
 
@@ -176,7 +196,11 @@ GET /api/{tool}/checksums  # 所有 SHA256 校验值
 POST /api/{tool}/refresh   # 手动触发更新
 ```
 
-其中 `{tool}` 可以是：`claude-code`、`codex`、`gemini`、`node`、`node-pty`
+其中 `{tool}` 可以是：`claude-code`、`codex`、`gemini`、`installer`、`node`、`node-pty`
+
+说明：
+- `stable` 未配置时会回退到 `latest`
+- `/api/*/info` 会额外返回 `sync` 字段（最近一次同步成功/失败时间、耗时、错误摘要）
 
 ### 示例响应
 

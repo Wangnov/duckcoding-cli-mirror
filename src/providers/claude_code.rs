@@ -7,16 +7,17 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
-use crate::config::{ClaudeCodeConfig, StorageConfig, StorageMode};
+use crate::config::{ClaudeCodeConfig, HttpConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
+use crate::http_client::build_http_client;
 use crate::oss;
 use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
 use crate::s3;
+use crate::storage_clients::StorageClients;
 
 const PROVIDER_NAME: &str = "claude-code";
 
@@ -48,23 +49,27 @@ pub struct ClaudeCodeProvider {
     client: Client,
     cache: Arc<CacheManager>,
     storage: StorageConfig,
+    storage_clients: StorageClients,
 }
 
 impl ClaudeCodeProvider {
-    pub fn new(config: ClaudeCodeConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
-        let client = Client::builder()
-            .user_agent("duckcoding-cli-mirror/0.1.0")
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("Failed to create HTTP client");
+    pub fn new(
+        config: ClaudeCodeConfig,
+        cache: Arc<CacheManager>,
+        storage: StorageConfig,
+        storage_clients: StorageClients,
+        http: HttpConfig,
+    ) -> Result<Self> {
+        let client = build_http_client(&http)
+            .with_context(|| "Failed to create HTTP client for claude-code")?;
 
-        Self {
+        Ok(Self {
             config,
             client,
             cache,
             storage,
-        }
+            storage_clients,
+        })
     }
 
     /// Get version for a tag from upstream
@@ -200,7 +205,11 @@ impl ClaudeCodeProvider {
 
         let total_size = response.content_length();
         let (size, sha256) = if matches!(self.storage.mode, StorageMode::Oss) {
-            let upload = oss::upload_stream(
+            let Some(client) = self.storage_clients.oss() else {
+                return Err(MirrorError::Provider("OSS client not initialized".to_string()).into());
+            };
+            let upload = oss::upload_stream_with_client(
+                client,
                 &self.storage.oss,
                 object_key,
                 "application/octet-stream",
@@ -210,7 +219,11 @@ impl ClaudeCodeProvider {
             .await?;
             (upload.size, upload.sha256)
         } else if matches!(self.storage.mode, StorageMode::S3) {
-            let upload = s3::upload_stream(
+            let Some(client) = self.storage_clients.s3() else {
+                return Err(MirrorError::Provider("S3 client not initialized".to_string()).into());
+            };
+            let upload = s3::upload_stream_with_client(
+                client,
                 &self.storage.s3,
                 object_key,
                 "application/octet-stream",
@@ -235,7 +248,10 @@ impl ClaudeCodeProvider {
         expected_sha256: &str,
         expected_size: u64,
     ) -> Result<Option<DownloadResult>> {
-        let info = s3::head_object_info(&self.storage.s3, object_key).await?;
+        let Some(client) = self.storage_clients.s3() else {
+            return Ok(None);
+        };
+        let info = s3::head_object_info_with_client(client, &self.storage.s3, object_key).await?;
         let Some(info) = info else {
             return Ok(None);
         };
@@ -374,7 +390,13 @@ impl ClaudeCodeProvider {
                     .cache
                     .build_object_key(PROVIDER_NAME, &["versions", version, "manifest.json"])
                     .ok_or_else(|| MirrorError::Provider("Invalid manifest key".to_string()))?;
-                oss::put_bytes(
+                let Some(client) = self.storage_clients.oss() else {
+                    return Err(
+                        MirrorError::Provider("OSS client not initialized".to_string()).into(),
+                    );
+                };
+                oss::put_bytes_with_client(
+                    client,
                     &self.storage.oss,
                     &key,
                     "application/json",
@@ -387,7 +409,13 @@ impl ClaudeCodeProvider {
                     .cache
                     .build_object_key(PROVIDER_NAME, &["versions", version, "manifest.json"])
                     .ok_or_else(|| MirrorError::Provider("Invalid manifest key".to_string()))?;
-                s3::put_bytes(
+                let Some(client) = self.storage_clients.s3() else {
+                    return Err(
+                        MirrorError::Provider("S3 client not initialized".to_string()).into(),
+                    );
+                };
+                s3::put_bytes_with_client(
+                    client,
                     &self.storage.s3,
                     &key,
                     "application/json",
@@ -495,10 +523,24 @@ impl ClaudeCodeProvider {
                             );
                             match storage_mode {
                                 StorageMode::Oss => {
-                                    let _ = oss::delete_object(&provider.storage.oss, &key).await;
+                                    if let Some(client) = provider.storage_clients.oss() {
+                                        let _ = oss::delete_object_with_client(
+                                            client,
+                                            &provider.storage.oss,
+                                            &key,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 StorageMode::S3 => {
-                                    let _ = s3::delete_object(&provider.storage.s3, &key).await;
+                                    if let Some(client) = provider.storage_clients.s3() {
+                                        let _ = s3::delete_object_with_client(
+                                            client,
+                                            &provider.storage.s3,
+                                            &key,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 StorageMode::Local => {}
                             }
@@ -698,13 +740,22 @@ impl ClaudeCodeProvider {
             for key in keys {
                 match self.storage.mode {
                     StorageMode::Oss => {
-                        if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                            warn!("Failed to delete OSS object {}: {:?}", key, e);
+                        if let Some(client) = self.storage_clients.oss() {
+                            if let Err(e) =
+                                oss::delete_object_with_client(client, &self.storage.oss, &key)
+                                    .await
+                            {
+                                warn!("Failed to delete OSS object {}: {:?}", key, e);
+                            }
                         }
                     }
                     StorageMode::S3 => {
-                        if let Err(e) = s3::delete_object(&self.storage.s3, &key).await {
-                            warn!("Failed to delete S3 object {}: {:?}", key, e);
+                        if let Some(client) = self.storage_clients.s3() {
+                            if let Err(e) =
+                                s3::delete_object_with_client(client, &self.storage.s3, &key).await
+                            {
+                                warn!("Failed to delete S3 object {}: {:?}", key, e);
+                            }
                         }
                     }
                     StorageMode::Local => {}
@@ -716,6 +767,7 @@ impl ClaudeCodeProvider {
     /// Sync all configured tags
     pub async fn sync_all(&self) -> Result<Vec<String>> {
         let mut updated = Vec::new();
+        let mut errors = Vec::new();
 
         for tag in &self.config.tags {
             match self.sync_tag(tag).await {
@@ -725,15 +777,26 @@ impl ClaudeCodeProvider {
                 Ok(None) => {}
                 Err(e) => {
                     warn!("Failed to sync tag {}: {:?}", tag, e);
+                    errors.push(format!("{}: {}", tag, e));
                 }
             }
         }
 
-        Ok(updated)
+        if errors.is_empty() {
+            Ok(updated)
+        } else {
+            Err(anyhow::anyhow!(errors.join("; ")))
+        }
     }
 
     /// Get cached tag version
     pub async fn get_tag_version(&self, tag: &str) -> Option<String> {
+        if tag == "stable" {
+            if let Some(version) = self.cache.read_tag(PROVIDER_NAME, "stable").await {
+                return Some(version);
+            }
+            return self.cache.read_tag(PROVIDER_NAME, "latest").await;
+        }
         self.cache.read_tag(PROVIDER_NAME, tag).await
     }
 
@@ -765,7 +828,8 @@ impl ClaudeCodeProvider {
         serde_json::json!({
             "tags": provider.tags,
             "platforms": platforms,
-            "updated_at": provider.updated_at
+            "updated_at": provider.updated_at,
+            "sync": &provider.sync,
         })
     }
 }

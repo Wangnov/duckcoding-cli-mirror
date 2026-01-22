@@ -1,25 +1,22 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use futures::{StreamExt, stream};
-use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
 use crate::cache::{CacheManager, PlatformMetadata, VersionMetadata};
-use crate::config::{NodeConfig, StorageConfig, StorageMode};
+use crate::config::{HttpConfig, NodeConfig, StorageConfig, StorageMode};
 use crate::error::MirrorError;
 use crate::oss;
-use crate::retry::{RetryPolicy, send_with_retry, sync_concurrency};
+use crate::providers::github::{DownloadResult, GithubClient, Release};
+use crate::retry::sync_concurrency;
 use crate::s3;
+use crate::storage_clients::StorageClients;
 
 const PROVIDER_NAME: &str = "node";
-const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Debug, Deserialize)]
 struct ChecksumsFile {
@@ -41,106 +38,31 @@ struct ChecksumsEntry {
     asset: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Release {
-    tag_name: String,
-    prerelease: bool,
-    draft: bool,
-    assets: Vec<Asset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Asset {
-    name: String,
-    browser_download_url: String,
-}
-
-struct DownloadResult {
-    size: u64,
-    sha256: String,
-}
-
 pub struct NodeProvider {
     config: NodeConfig,
-    client: Client,
     cache: Arc<CacheManager>,
-    github_token: Option<String>,
     storage: StorageConfig,
+    storage_clients: StorageClients,
+    github: GithubClient,
 }
 
 impl NodeProvider {
-    pub fn new(config: NodeConfig, cache: Arc<CacheManager>, storage: StorageConfig) -> Self {
-        let client = Client::builder()
-            .user_agent("duckcoding-cli-mirror/0.1.0")
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("Failed to create HTTP client");
+    pub fn new(
+        config: NodeConfig,
+        cache: Arc<CacheManager>,
+        storage: StorageConfig,
+        storage_clients: StorageClients,
+        http: HttpConfig,
+    ) -> Result<Self> {
+        let github = GithubClient::new(&http)?;
 
-        let github_token = std::env::var("GITHUB_TOKEN").ok();
-
-        Self {
+        Ok(Self {
             config,
-            client,
             cache,
-            github_token,
             storage,
-        }
-    }
-
-    fn api_request(&self, url: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .client
-            .get(url)
-            .header(header::ACCEPT, "application/vnd.github+json");
-        if let Some(token) = &self.github_token {
-            req = req.bearer_auth(token);
-        }
-        req
-    }
-
-    async fn fetch_releases(&self) -> Result<Vec<Release>> {
-        let url = format!("{}/repos/{}/releases", GITHUB_API_BASE, self.config.repo);
-        let response = send_with_retry(|| self.api_request(&url), RetryPolicy::default())
-            .await
-            .with_context(|| format!("Failed to fetch releases from {}", url))?;
-
-        let status = response.status();
-        if status == StatusCode::NOT_FOUND {
-            return Err(MirrorError::VersionNotFound("releases".to_string()).into());
-        }
-        if !status.is_success() {
-            return Err(
-                MirrorError::Provider(format!("Failed to fetch releases: {}", status)).into(),
-            );
-        }
-
-        let releases = response.json::<Vec<Release>>().await?;
-        Ok(releases)
-    }
-
-    async fn fetch_release_by_tag(&self, tag: &str) -> Result<Release> {
-        let url = format!(
-            "{}/repos/{}/releases/tags/{}",
-            GITHUB_API_BASE, self.config.repo, tag
-        );
-        let response = send_with_retry(|| self.api_request(&url), RetryPolicy::default())
-            .await
-            .with_context(|| format!("Failed to fetch release tag {}", tag))?;
-
-        let status = response.status();
-        if status == StatusCode::NOT_FOUND {
-            return Err(MirrorError::VersionNotFound(tag.to_string()).into());
-        }
-        if !status.is_success() {
-            return Err(MirrorError::Provider(format!(
-                "Failed to fetch release {}: {}",
-                tag, status
-            ))
-            .into());
-        }
-
-        Ok(response.json::<Release>().await?)
+            storage_clients,
+            github,
+        })
     }
 
     fn select_release<'a>(&self, releases: &'a [Release], tag: &str) -> Option<&'a Release> {
@@ -166,54 +88,11 @@ impl NodeProvider {
     }
 
     async fn download_asset_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let url = url.to_string();
-        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
-            .await
-            .with_context(|| format!("Failed to download asset {}", url))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(MirrorError::Provider(format!(
-                "Failed to download asset {}: {}",
-                url, status
-            ))
-            .into());
-        }
-        let bytes = response.bytes().await?;
-        Ok(bytes.to_vec())
+        self.github.download_asset_bytes(url).await
     }
 
     async fn download_asset_to_path(&self, url: &str, path: &Path) -> Result<DownloadResult> {
-        let url = url.to_string();
-        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
-            .await
-            .with_context(|| format!("Failed to download asset {}", url))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(MirrorError::Provider(format!(
-                "Failed to download asset {}: {}",
-                url, status
-            ))
-            .into());
-        }
-
-        let mut file = tokio::fs::File::create(path).await?;
-        let mut hasher = Sha256::new();
-        let mut size: u64 = 0;
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            size += chunk.len() as u64;
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-        }
-
-        file.flush().await?;
-
-        Ok(DownloadResult {
-            size,
-            sha256: hex::encode(hasher.finalize()),
-        })
+        self.github.download_asset_to_path(url, path).await
     }
 
     async fn download_asset_to_remote(
@@ -221,59 +100,15 @@ impl NodeProvider {
         url: &str,
         object_key: &str,
     ) -> Result<DownloadResult> {
-        let url = url.to_string();
-        let response = send_with_retry(|| self.client.get(&url), RetryPolicy::default())
+        self.github
+            .download_asset_to_storage(
+                url,
+                &self.storage,
+                &self.storage_clients,
+                object_key,
+                "application/octet-stream",
+            )
             .await
-            .with_context(|| format!("Failed to download asset {}", url))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(MirrorError::Provider(format!(
-                "Failed to download asset {}: {}",
-                url, status
-            ))
-            .into());
-        }
-
-        let total_size = response.content_length();
-        let result = match self.storage.mode {
-            StorageMode::Oss => {
-                let upload = oss::upload_stream(
-                    &self.storage.oss,
-                    object_key,
-                    "application/octet-stream",
-                    total_size,
-                    response.bytes_stream(),
-                )
-                .await?;
-                DownloadResult {
-                    size: upload.size,
-                    sha256: upload.sha256,
-                }
-            }
-            StorageMode::S3 => {
-                let upload = s3::upload_stream(
-                    &self.storage.s3,
-                    object_key,
-                    "application/octet-stream",
-                    total_size,
-                    response.bytes_stream(),
-                )
-                .await?;
-                DownloadResult {
-                    size: upload.size,
-                    sha256: upload.sha256,
-                }
-            }
-            StorageMode::Local => {
-                return Err(MirrorError::Provider(
-                    "download_asset_to_remote called in local mode".to_string(),
-                )
-                .into());
-            }
-        };
-
-        Ok(result)
     }
 
     async fn try_use_existing_s3_object(
@@ -282,7 +117,10 @@ impl NodeProvider {
         expected_sha256: &str,
         expected_size: u64,
     ) -> Result<Option<DownloadResult>> {
-        let info = s3::head_object_info(&self.storage.s3, object_key).await?;
+        let Some(client) = self.storage_clients.s3() else {
+            return Ok(None);
+        };
+        let info = s3::head_object_info_with_client(client, &self.storage.s3, object_key).await?;
         let Some(info) = info else {
             return Ok(None);
         };
@@ -331,17 +169,27 @@ impl NodeProvider {
             .into());
         }
 
-        let (name, entry) = files.iter().next().unwrap();
+        let (name, entry) = files.iter().next().ok_or_else(|| {
+            MirrorError::Provider(format!("No files listed for platform {}", platform))
+        })?;
         Ok((name.clone(), entry.clone()))
     }
 
     /// Get version for a tag from upstream
     pub async fn fetch_upstream_tag(&self, tag: &str) -> Result<String> {
-        let releases = self.fetch_releases().await?;
-        let release = self
-            .select_release(&releases, tag)
-            .ok_or_else(|| MirrorError::VersionNotFound(tag.to_string()))?;
-        Ok(release.tag_name.clone())
+        if tag == "latest" || tag == "stable" {
+            let releases = self.github.fetch_releases(&self.config.repo).await?;
+            let release = self
+                .select_release(&releases, tag)
+                .ok_or_else(|| MirrorError::VersionNotFound(tag.to_string()))?;
+            Ok(release.tag_name.clone())
+        } else {
+            let release = self
+                .github
+                .fetch_release_by_tag(&self.config.repo, tag)
+                .await?;
+            Ok(release.tag_name.clone())
+        }
     }
 
     pub async fn sync_tag(&self, tag: &str) -> Result<Option<String>> {
@@ -395,7 +243,10 @@ impl NodeProvider {
         }
 
         info!("Syncing version: {}", version);
-        let release = self.fetch_release_by_tag(version).await?;
+        let release = self
+            .github
+            .fetch_release_by_tag(&self.config.repo, version)
+            .await?;
         let checksums_asset = release
             .assets
             .iter()
@@ -505,10 +356,24 @@ impl NodeProvider {
                             );
                             match storage_mode {
                                 StorageMode::Oss => {
-                                    let _ = oss::delete_object(&provider.storage.oss, &key).await;
+                                    if let Some(client) = provider.storage_clients.oss() {
+                                        let _ = oss::delete_object_with_client(
+                                            client,
+                                            &provider.storage.oss,
+                                            &key,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 StorageMode::S3 => {
-                                    let _ = s3::delete_object(&provider.storage.s3, &key).await;
+                                    if let Some(client) = provider.storage_clients.s3() {
+                                        let _ = s3::delete_object_with_client(
+                                            client,
+                                            &provider.storage.s3,
+                                            &key,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 StorageMode::Local => {}
                             }
@@ -627,10 +492,34 @@ impl NodeProvider {
                 tokio::fs::write(&path, bytes).await?;
             }
             StorageMode::Oss => {
-                oss::put_bytes(&self.storage.oss, &key, "application/json", bytes.to_vec()).await?;
+                let Some(client) = self.storage_clients.oss() else {
+                    return Err(
+                        MirrorError::Provider("OSS client not initialized".to_string()).into(),
+                    );
+                };
+                oss::put_bytes_with_client(
+                    client,
+                    &self.storage.oss,
+                    &key,
+                    "application/json",
+                    bytes.to_vec(),
+                )
+                .await?;
             }
             StorageMode::S3 => {
-                s3::put_bytes(&self.storage.s3, &key, "application/json", bytes.to_vec()).await?;
+                let Some(client) = self.storage_clients.s3() else {
+                    return Err(
+                        MirrorError::Provider("S3 client not initialized".to_string()).into(),
+                    );
+                };
+                s3::put_bytes_with_client(
+                    client,
+                    &self.storage.s3,
+                    &key,
+                    "application/json",
+                    bytes.to_vec(),
+                )
+                .await?;
             }
         }
 
@@ -667,10 +556,22 @@ impl NodeProvider {
                 tokio::fs::write(&path, bytes).await?;
             }
             StorageMode::Oss => {
-                oss::put_bytes(&self.storage.oss, &key, "text/plain", bytes).await?;
+                let Some(client) = self.storage_clients.oss() else {
+                    return Err(
+                        MirrorError::Provider("OSS client not initialized".to_string()).into(),
+                    );
+                };
+                oss::put_bytes_with_client(client, &self.storage.oss, &key, "text/plain", bytes)
+                    .await?;
             }
             StorageMode::S3 => {
-                s3::put_bytes(&self.storage.s3, &key, "text/plain", bytes).await?;
+                let Some(client) = self.storage_clients.s3() else {
+                    return Err(
+                        MirrorError::Provider("S3 client not initialized".to_string()).into(),
+                    );
+                };
+                s3::put_bytes_with_client(client, &self.storage.s3, &key, "text/plain", bytes)
+                    .await?;
             }
         }
 
@@ -729,13 +630,22 @@ impl NodeProvider {
             for key in keys {
                 match self.storage.mode {
                     StorageMode::Oss => {
-                        if let Err(e) = oss::delete_object(&self.storage.oss, &key).await {
-                            warn!("Failed to delete OSS object {}: {:?}", key, e);
+                        if let Some(client) = self.storage_clients.oss() {
+                            if let Err(e) =
+                                oss::delete_object_with_client(client, &self.storage.oss, &key)
+                                    .await
+                            {
+                                warn!("Failed to delete OSS object {}: {:?}", key, e);
+                            }
                         }
                     }
                     StorageMode::S3 => {
-                        if let Err(e) = s3::delete_object(&self.storage.s3, &key).await {
-                            warn!("Failed to delete S3 object {}: {:?}", key, e);
+                        if let Some(client) = self.storage_clients.s3() {
+                            if let Err(e) =
+                                s3::delete_object_with_client(client, &self.storage.s3, &key).await
+                            {
+                                warn!("Failed to delete S3 object {}: {:?}", key, e);
+                            }
                         }
                     }
                     StorageMode::Local => {}
@@ -746,19 +656,33 @@ impl NodeProvider {
 
     pub async fn sync_all(&self) -> Result<Vec<String>> {
         let mut updated = Vec::new();
+        let mut errors = Vec::new();
 
         for tag in &self.config.tags {
             match self.sync_tag(tag).await {
                 Ok(Some(version)) => updated.push(format!("{}: {}", tag, version)),
                 Ok(None) => {}
-                Err(e) => warn!("Failed to sync tag {}: {:?}", tag, e),
+                Err(e) => {
+                    warn!("Failed to sync tag {}: {:?}", tag, e);
+                    errors.push(format!("{}: {}", tag, e));
+                }
             }
         }
 
-        Ok(updated)
+        if errors.is_empty() {
+            Ok(updated)
+        } else {
+            Err(anyhow::anyhow!(errors.join("; ")))
+        }
     }
 
     pub async fn get_tag_version(&self, tag: &str) -> Option<String> {
+        if tag == "stable" {
+            if let Some(version) = self.cache.read_tag(PROVIDER_NAME, "stable").await {
+                return Some(version);
+            }
+            return self.cache.read_tag(PROVIDER_NAME, "latest").await;
+        }
         self.cache.read_tag(PROVIDER_NAME, tag).await
     }
 
@@ -792,7 +716,8 @@ impl NodeProvider {
         serde_json::json!({
             "tags": provider.tags,
             "platforms": platforms,
-            "updated_at": provider.updated_at
+            "updated_at": provider.updated_at,
+            "sync": &provider.sync,
         })
     }
 }

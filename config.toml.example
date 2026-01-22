@@ -10,6 +10,20 @@ host = "0.0.0.0"
 # If not set, install scripts will return 503
 # public_url = "http://yourip:1357"
 
+# Optional: admin token for POST /api/*/refresh (Authorization: Bearer <token>)
+# If not set, refresh endpoints will return 403.
+# refresh_token = "replace-with-a-strong-random-token"
+
+# Optional: refresh throttling window per provider (seconds). Set to 0 to disable.
+# refresh_min_interval_seconds = 10
+
+# HTTP settings
+[http]
+# 连接超时（秒）
+connect_timeout_seconds = 10
+# 请求总超时（秒），文件较大时建议适当调高；设为 0 表示不限制总时长
+request_timeout_seconds = 3600
+
 # Cache settings
 [cache]
 dir = "./cache"
@@ -109,14 +123,14 @@ tags = ["latest"]
 include_prerelease = false
 repo = "Wangnov/duckcoding-cli-mirror"
 platforms = [
-    "darwin-x64",
-    "darwin-arm64",
-    "linux-x64",
-    "linux-arm64",
-    "linux-x64-musl",
-    "linux-arm64-musl",
-    "win32-x64",
-    "win32-arm64"
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc"
 ]
 
 # Node.js runtime mirror configuration (GitHub Release upstream)

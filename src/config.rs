@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -7,6 +8,9 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+
+    #[serde(default)]
+    pub http: HttpConfig,
 
     #[serde(default)]
     pub storage: StorageConfig,
@@ -46,8 +50,52 @@ pub struct ServerConfig {
 
     /// Public URL for install scripts (e.g., "http://yourip:1357")
     /// If not set, install script endpoints will return 503
-    #[serde(default)]
+    #[serde(default = "default_public_url")]
     pub public_url: Option<String>,
+
+    /// Admin token required for POST /api/*/refresh.
+    ///
+    /// Send as `Authorization: Bearer <token>`. If not configured, refresh endpoints
+    /// will return 403.
+    #[serde(default = "default_refresh_token")]
+    pub refresh_token: Option<String>,
+
+    /// Per-provider minimum interval (seconds) between refresh requests.
+    /// Set to 0 to disable throttling.
+    #[serde(default = "default_refresh_min_interval_seconds")]
+    pub refresh_min_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default = "default_http_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+
+    #[serde(default = "default_http_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_seconds: default_http_connect_timeout_seconds(),
+            request_timeout_seconds: default_http_request_timeout_seconds(),
+        }
+    }
+}
+
+fn default_http_connect_timeout_seconds() -> u64 {
+    std::env::var("MIRROR_HTTP_CONNECT_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+}
+
+fn default_http_request_timeout_seconds() -> u64 {
+    std::env::var("MIRROR_HTTP_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,12 +327,25 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             public_url: default_public_url(),
+            refresh_token: default_refresh_token(),
+            refresh_min_interval_seconds: default_refresh_min_interval_seconds(),
         }
     }
 }
 
 fn default_public_url() -> Option<String> {
     std::env::var("MIRROR_PUBLIC_URL").ok()
+}
+
+fn default_refresh_token() -> Option<String> {
+    std::env::var("MIRROR_REFRESH_TOKEN").ok()
+}
+
+fn default_refresh_min_interval_seconds() -> u64 {
+    std::env::var("MIRROR_REFRESH_MIN_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
 }
 
 fn default_port() -> u16 {
@@ -575,7 +636,16 @@ fn default_installer_include_prerelease() -> bool {
 }
 
 fn default_installer_platforms() -> Vec<String> {
-    default_codex_platforms()
+    vec![
+        "x86_64-apple-darwin".to_string(),
+        "aarch64-apple-darwin".to_string(),
+        "x86_64-unknown-linux-gnu".to_string(),
+        "aarch64-unknown-linux-gnu".to_string(),
+        "x86_64-unknown-linux-musl".to_string(),
+        "aarch64-unknown-linux-musl".to_string(),
+        "x86_64-pc-windows-msvc".to_string(),
+        "aarch64-pc-windows-msvc".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,6 +798,42 @@ impl Config {
     }
 }
 
+pub fn normalize_public_url(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("server.public_url is empty");
+    }
+    if trimmed.contains(['\r', '\n']) {
+        anyhow::bail!("server.public_url must not contain newlines");
+    }
+    // We inject public_url into shell/PowerShell scripts; keep it strict to avoid injection.
+    if trimmed.contains(['"', '\'', '`', '$', '\\']) || trimmed.chars().any(char::is_whitespace) {
+        anyhow::bail!(
+            "server.public_url contains unsafe characters (quotes/whitespace/$/backtick/backslash)"
+        );
+    }
+
+    // Avoid accidental double slashes when scripts append paths.
+    let normalized = trimmed.trim_end_matches('/').to_string();
+
+    let url = Url::parse(&normalized).context("server.public_url is not a valid URL")?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => anyhow::bail!(
+            "server.public_url scheme must be http/https, got: {}",
+            scheme
+        ),
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("server.public_url must include a host");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("server.public_url must not include query or fragment");
+    }
+
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,10 +945,24 @@ repo = "openai/codex"
     #[test]
     fn test_default_installer_platforms() {
         let platforms = default_installer_platforms();
-        assert!(platforms.contains(&"darwin-arm64".to_string()));
-        assert!(platforms.contains(&"linux-x64".to_string()));
-        assert!(platforms.contains(&"win32-x64".to_string()));
-        assert!(platforms.contains(&"win32-arm64".to_string()));
+        assert!(platforms.contains(&"aarch64-apple-darwin".to_string()));
+        assert!(platforms.contains(&"x86_64-unknown-linux-gnu".to_string()));
+        assert!(platforms.contains(&"x86_64-pc-windows-msvc".to_string()));
+        assert!(platforms.contains(&"aarch64-pc-windows-msvc".to_string()));
         assert_eq!(platforms.len(), 8);
+    }
+
+    #[test]
+    fn test_normalize_public_url_trims_and_strips_trailing_slash() {
+        let url = normalize_public_url("  http://example.com/  ").unwrap();
+        assert_eq!(url, "http://example.com");
+    }
+
+    #[test]
+    fn test_normalize_public_url_rejects_unsafe_characters() {
+        assert!(normalize_public_url("http://example.com/\nfoo").is_err());
+        assert!(normalize_public_url("http://example.com/\"bad\"").is_err());
+        assert!(normalize_public_url("http://example.com/$bad").is_err());
+        assert!(normalize_public_url("http://example.com/`bad`").is_err());
     }
 }

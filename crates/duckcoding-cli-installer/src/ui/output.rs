@@ -1,5 +1,5 @@
 use crate::ui::banner;
-use crate::ui::i18n::{Lang, tr};
+use crate::ui::i18n::{Lang, detect_lang, tr};
 use crate::ui::progress::{DownloadProgress, Spinner};
 use crate::ui::style::Theme;
 use serde::{Deserialize, Serialize};
@@ -25,20 +25,24 @@ pub struct InstallEvent {
 static OUTPUT: OnceLock<OutputConfig> = OnceLock::new();
 static EVENTS: OnceLock<Mutex<Vec<InstallEvent>>> = OnceLock::new();
 
+fn events() -> &'static Mutex<Vec<InstallEvent>> {
+    EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 pub fn init_output(json: bool, lang: Lang) {
     let _ = OUTPUT.set(OutputConfig { json, lang });
     let _ = EVENTS.set(Mutex::new(Vec::new()));
 }
 
 pub fn output() -> &'static OutputConfig {
-    OUTPUT.get().expect("output not initialized")
+    OUTPUT.get_or_init(|| OutputConfig {
+        json: false,
+        lang: detect_lang(None),
+    })
 }
 
 pub fn record_event(provider: &str, version: &str, tag: &str, path: Option<PathBuf>) {
-    let Some(events) = EVENTS.get() else {
-        return;
-    };
-    let mut events = events.lock().expect("events lock");
+    let mut events = events().lock().unwrap_or_else(|e| e.into_inner());
     events.push(InstallEvent {
         provider: provider.to_string(),
         version: version.to_string(),
@@ -49,10 +53,7 @@ pub fn record_event(provider: &str, version: &str, tag: &str, path: Option<PathB
 }
 
 pub fn emit_json(success: bool, error: Option<String>) {
-    let events = EVENTS
-        .get()
-        .map(|m| m.lock().unwrap().clone())
-        .unwrap_or_default();
+    let events = events().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let value = serde_json::json!({
         "success": success,
         "error": error,

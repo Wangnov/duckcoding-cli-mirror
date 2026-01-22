@@ -2,16 +2,19 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
-    http::{StatusCode, header},
+    extract::{Path, Request, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use std::{io::ErrorKind, sync::Arc};
+use chrono::Utc;
+use std::future::Future;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
-use tokio::time::{Duration, interval};
-use tokio_util::io::ReaderStream;
+use tokio::time::{Duration, Instant, interval};
+use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeFile;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -23,11 +26,13 @@ use crate::providers::{
     NodePtyProvider,
 };
 use crate::s3;
+use crate::storage_clients::StorageClients;
 
 /// Shared application state
 pub struct AppState {
     pub config: Config,
     pub cache: Arc<CacheManager>,
+    pub storage_clients: StorageClients,
     pub claude_code: ClaudeCodeProvider,
     pub codex: CodexProvider,
     pub gemini: GeminiProvider,
@@ -35,25 +40,60 @@ pub struct AppState {
     pub node: NodeProvider,
     pub node_pty: NodePtyProvider,
     pub sync_lock: Mutex<()>,
+    pub refresh_throttle: Mutex<HashMap<&'static str, Instant>>,
 }
 
-pub async fn run(config: Config, cache: CacheManager) -> Result<()> {
-    let cache = Arc::new(cache);
-
-    // Create providers
+async fn build_state(config: Config, cache: Arc<CacheManager>) -> Result<Arc<AppState>> {
+    let storage_clients = StorageClients::new(&config.storage).await?;
     let storage = config.storage.clone();
-    let claude_code =
-        ClaudeCodeProvider::new(config.claude_code.clone(), cache.clone(), storage.clone());
-    let codex = CodexProvider::new(config.codex.clone(), cache.clone(), storage.clone());
-    let gemini = GeminiProvider::new(config.gemini.clone(), cache.clone(), storage.clone());
-    let installer =
-        InstallerProvider::new(config.installer.clone(), cache.clone(), storage.clone());
-    let node = NodeProvider::new(config.node.clone(), cache.clone(), storage.clone());
-    let node_pty = NodePtyProvider::new(config.node_pty.clone(), cache.clone(), storage);
+    let http = config.http.clone();
+    let claude_code = ClaudeCodeProvider::new(
+        config.claude_code.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )?;
+    let codex = CodexProvider::new(
+        config.codex.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )?;
+    let gemini = GeminiProvider::new(
+        config.gemini.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )?;
+    let installer = InstallerProvider::new(
+        config.installer.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )?;
+    let node = NodeProvider::new(
+        config.node.clone(),
+        cache.clone(),
+        storage.clone(),
+        storage_clients.clone(),
+        http.clone(),
+    )?;
+    let node_pty = NodePtyProvider::new(
+        config.node_pty.clone(),
+        cache.clone(),
+        storage,
+        storage_clients.clone(),
+        http,
+    )?;
 
-    let state = Arc::new(AppState {
-        config: config.clone(),
-        cache: cache.clone(),
+    Ok(Arc::new(AppState {
+        config,
+        cache,
+        storage_clients,
         claude_code,
         codex,
         gemini,
@@ -61,12 +101,31 @@ pub async fn run(config: Config, cache: CacheManager) -> Result<()> {
         node,
         node_pty,
         sync_lock: Mutex::new(()),
-    });
+        refresh_throttle: Mutex::new(HashMap::new()),
+    }))
+}
+
+pub async fn sync_once(config: Config, cache: CacheManager) -> Result<()> {
+    let cache = Arc::new(cache);
+    let state = build_state(config, cache).await?;
+    sync_all_locked(state.as_ref()).await?;
+    Ok(())
+}
+
+pub async fn run(mut config: Config, cache: CacheManager, skip_initial_sync: bool) -> Result<()> {
+    if let Some(public_url) = config.server.public_url.clone() {
+        config.server.public_url = Some(crate::config::normalize_public_url(&public_url)?);
+    }
+
+    let cache = Arc::new(cache);
+    let state = build_state(config.clone(), cache.clone()).await?;
 
     // Initial sync
-    info!("Performing initial cache sync...");
-    if let Err(e) = sync_all_locked(state.as_ref()).await {
-        error!("Initial sync failed: {}", e);
+    if !skip_initial_sync {
+        info!("Performing initial cache sync...");
+        if let Err(e) = sync_all_locked(state.as_ref()).await {
+            error!("Initial sync failed: {}", e);
+        }
     }
 
     // Start background update task
@@ -188,7 +247,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/node-pty/refresh", post(api_node_pty_refresh))
         // Add middleware
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                // Only allow cross-origin GET. Refresh endpoints are admin-only and not meant for browsers.
+                .allow_methods([Method::GET])
+                .allow_headers([header::AUTHORIZATION, header::RANGE]),
+        )
         .with_state(state)
 }
 
@@ -199,6 +264,7 @@ async fn health_check() -> &'static str {
 
 async fn serve_storage_file(
     state: &AppState,
+    req: Request,
     provider: &str,
     path_segments: &[&str],
     content_type: &'static str,
@@ -210,47 +276,45 @@ async fn serve_storage_file(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     match state.config.storage.mode {
-        StorageMode::Local => serve_local_file(state, &key, content_type, filename).await,
-        StorageMode::Oss => serve_oss_redirect(state, &key),
-        StorageMode::S3 => serve_s3_redirect(state, &key).await,
+        StorageMode::Local => serve_local_file(state, req, &key, content_type, filename).await,
+        StorageMode::Oss => {
+            drop(req);
+            serve_oss_redirect(state, &key)
+        }
+        StorageMode::S3 => {
+            drop(req);
+            serve_s3_redirect(state, &key).await
+        }
     }
 }
 
 async fn serve_local_file(
     state: &AppState,
+    req: Request,
     key: &str,
     content_type: &'static str,
     filename: Option<&str>,
 ) -> Result<Response, StatusCode> {
     let path = state.cache.config.dir.join(key);
-    let file = tokio::fs::File::open(&path).await.map_err(|e| {
-        if e.kind() == ErrorKind::NotFound {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+    let response = ServeFile::new(path).oneshot(req).await.map_err(|err| {
+        error!("Failed to serve local file: {}", err);
+        StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (mut parts, body) = response.into_parts();
 
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    let mut builder = Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, metadata.len());
+    parts
+        .headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
 
     if let Some(name) = filename {
-        builder = builder.header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", name),
-        );
+        let header_value = content_disposition_header_value(name)?;
+        parts
+            .headers
+            .insert(header::CONTENT_DISPOSITION, header_value);
     }
 
-    Ok(builder.body(body).unwrap())
+    Ok(Response::from_parts(parts, Body::new(body)))
 }
 
 fn serve_oss_redirect(state: &AppState, key: &str) -> Result<Response, StatusCode> {
@@ -259,26 +323,47 @@ fn serve_oss_redirect(state: &AppState, key: &str) -> Result<Response, StatusCod
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Response::builder()
+    let location = HeaderValue::from_str(&url).map_err(|e| {
+        error!("Failed to build OSS Location header: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Response::builder()
         .status(StatusCode::FOUND)
-        .header(header::LOCATION, url)
+        .header(header::LOCATION, location)
         .body(Body::empty())
-        .unwrap())
+        .map_err(|err| {
+            error!("Failed to build OSS redirect response: {}", err);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn serve_s3_redirect(state: &AppState, key: &str) -> Result<Response, StatusCode> {
-    let url = s3::presign_get_url(&state.config.storage.s3, key)
+    let client = state.storage_clients.s3().ok_or_else(|| {
+        error!("Storage mode is S3 but S3 client is not initialized");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let url = s3::presign_get_url_with_client(client, &state.config.storage.s3, key)
         .await
         .map_err(|e| {
             error!("Failed to presign S3 URL: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Response::builder()
+    let location = HeaderValue::from_str(&url).map_err(|e| {
+        error!("Failed to build S3 Location header: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Response::builder()
         .status(StatusCode::FOUND)
-        .header(header::LOCATION, url)
+        .header(header::LOCATION, location)
         .body(Body::empty())
-        .unwrap())
+        .map_err(|err| {
+            error!("Failed to build S3 redirect response: {}", err);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 // Get tag version
@@ -286,12 +371,6 @@ async fn claude_code_tag(
     State(state): State<Arc<AppState>>,
     Path(tag): Path<String>,
 ) -> Result<String, StatusCode> {
-    // Only allow known tags
-    if tag != "stable" && tag != "latest" {
-        // Try to parse as version number
-        return Err(StatusCode::NOT_FOUND);
-    }
-
     state
         .claude_code
         .get_tag_version(&tag)
@@ -304,10 +383,6 @@ async fn codex_tag(
     State(state): State<Arc<AppState>>,
     Path(tag): Path<String>,
 ) -> Result<String, StatusCode> {
-    if tag != "stable" && tag != "latest" {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
     state
         .codex
         .get_tag_version(&tag)
@@ -320,10 +395,6 @@ async fn gemini_tag(
     State(state): State<Arc<AppState>>,
     Path(tag): Path<String>,
 ) -> Result<String, StatusCode> {
-    if tag != "stable" && tag != "latest" {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
     state
         .gemini
         .get_tag_version(&tag)
@@ -336,10 +407,6 @@ async fn installer_tag(
     State(state): State<Arc<AppState>>,
     Path(tag): Path<String>,
 ) -> Result<String, StatusCode> {
-    if tag != "stable" && tag != "latest" {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
     state
         .installer
         .get_tag_version(&tag)
@@ -352,10 +419,6 @@ async fn node_tag(
     State(state): State<Arc<AppState>>,
     Path(tag): Path<String>,
 ) -> Result<String, StatusCode> {
-    if tag != "stable" && tag != "latest" {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
     state
         .node
         .get_tag_version(&tag)
@@ -368,10 +431,6 @@ async fn node_pty_tag(
     State(state): State<Arc<AppState>>,
     Path(tag): Path<String>,
 ) -> Result<String, StatusCode> {
-    if tag != "stable" && tag != "latest" {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
     state
         .node_pty
         .get_tag_version(&tag)
@@ -383,9 +442,11 @@ async fn node_pty_tag(
 async fn claude_code_manifest(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
     serve_storage_file(
         state.as_ref(),
+        req,
         "claude-code",
         &["versions", &version, "manifest.json"],
         "application/json",
@@ -398,6 +459,7 @@ async fn claude_code_manifest(
 async fn claude_code_binary(
     State(state): State<Arc<AppState>>,
     Path((version, platform, filename)): Path<(String, String, String)>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
     let expected_filename = if platform.starts_with("win32") {
         "claude.exe"
@@ -411,6 +473,7 @@ async fn claude_code_binary(
 
     serve_storage_file(
         state.as_ref(),
+        req,
         "claude-code",
         &["versions", &version, &platform, expected_filename],
         "application/octet-stream",
@@ -423,24 +486,28 @@ async fn claude_code_binary(
 async fn codex_binary(
     State(state): State<Arc<AppState>>,
     Path((version, platform, filename)): Path<(String, String, String)>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
-    let metadata = state.cache.get_metadata().await;
-    let provider = &metadata.codex;
-    let version_meta = provider
-        .versions
-        .get(&version)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let platform_meta = version_meta
-        .platforms
-        .get(&platform)
+    let expected_filename = state
+        .cache
+        .with_provider_metadata("codex", |provider| {
+            provider
+                .versions
+                .get(&version)
+                .and_then(|version_meta| version_meta.platforms.get(&platform))
+                .map(|platform_meta| platform_meta.filename.clone())
+        })
+        .await
+        .flatten()
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if platform_meta.filename != filename {
+    if expected_filename != filename {
         return Err(StatusCode::NOT_FOUND);
     }
 
     serve_storage_file(
         state.as_ref(),
+        req,
         "codex",
         &["versions", &version, &platform, &filename],
         "application/octet-stream",
@@ -453,9 +520,11 @@ async fn codex_binary(
 async fn gemini_binary(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
     serve_storage_file(
         state.as_ref(),
+        req,
         "gemini",
         &["versions", &version, "universal", "gemini.js"],
         "application/octet-stream",
@@ -468,24 +537,28 @@ async fn gemini_binary(
 async fn installer_binary(
     State(state): State<Arc<AppState>>,
     Path((version, platform, filename)): Path<(String, String, String)>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
-    let metadata = state.cache.get_metadata().await;
-    let provider = &metadata.installer;
-    let version_meta = provider
-        .versions
-        .get(&version)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let platform_meta = version_meta
-        .platforms
-        .get(&platform)
+    let expected_filename = state
+        .cache
+        .with_provider_metadata("installer", |provider| {
+            provider
+                .versions
+                .get(&version)
+                .and_then(|version_meta| version_meta.platforms.get(&platform))
+                .map(|platform_meta| platform_meta.filename.clone())
+        })
+        .await
+        .flatten()
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if platform_meta.filename != filename {
+    if expected_filename != filename {
         return Err(StatusCode::NOT_FOUND);
     }
 
     serve_storage_file(
         state.as_ref(),
+        req,
         "installer",
         &["versions", &version, &platform, &filename],
         "application/octet-stream",
@@ -499,46 +572,50 @@ async fn installer_checksum_txt(
     State(state): State<Arc<AppState>>,
     Path((version, platform)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
-    let metadata = state.cache.get_metadata().await;
-    let provider = &metadata.installer;
-    let version_meta = provider
-        .versions
-        .get(&version)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let platform_meta = version_meta
-        .platforms
-        .get(&platform)
+    let body = state
+        .cache
+        .with_provider_metadata("installer", |provider| {
+            provider
+                .versions
+                .get(&version)
+                .and_then(|version_meta| version_meta.platforms.get(&platform))
+                .map(|platform_meta| {
+                    format!("{}  {}\n", platform_meta.sha256, platform_meta.filename)
+                })
+        })
+        .await
+        .flatten()
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let body = format!("{}  {}\n", platform_meta.sha256, platform_meta.filename);
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(body))
-        .unwrap())
+    Ok(([(header::CONTENT_TYPE, "text/plain")], body).into_response())
 }
 
 // Download Node.js runtime
 async fn node_binary(
     State(state): State<Arc<AppState>>,
     Path((version, platform, filename)): Path<(String, String, String)>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
-    let metadata = state.cache.get_metadata().await;
-    let provider = &metadata.node;
-    let version_meta = provider
-        .versions
-        .get(&version)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let platform_meta = version_meta
-        .platforms
-        .get(&platform)
+    let expected_filename = state
+        .cache
+        .with_provider_metadata("node", |provider| {
+            provider
+                .versions
+                .get(&version)
+                .and_then(|version_meta| version_meta.platforms.get(&platform))
+                .map(|platform_meta| platform_meta.filename.clone())
+        })
+        .await
+        .flatten()
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if platform_meta.filename != filename {
+    if expected_filename != filename {
         return Err(StatusCode::NOT_FOUND);
     }
 
     serve_storage_file(
         state.as_ref(),
+        req,
         "node",
         &["versions", &version, &platform, &filename],
         "application/octet-stream",
@@ -550,9 +627,11 @@ async fn node_binary(
 async fn node_checksums(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
     serve_storage_file(
         state.as_ref(),
+        req,
         "node",
         &["versions", &version, "checksums.json"],
         "application/json",
@@ -564,9 +643,11 @@ async fn node_checksums(
 async fn node_shasums(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
     serve_storage_file(
         state.as_ref(),
+        req,
         "node",
         &["versions", &version, "SHASUMS256.txt"],
         "text/plain",
@@ -579,29 +660,33 @@ async fn node_shasums(
 async fn node_pty_binary(
     State(state): State<Arc<AppState>>,
     Path((version, platform, filename)): Path<(String, String, String)>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
-    let metadata = state.cache.get_metadata().await;
-    let provider = &metadata.node_pty;
-    let version_meta = provider
-        .versions
-        .get(&version)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let platform_meta = version_meta
-        .platforms
-        .get(&platform)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let allowed = state
+        .cache
+        .with_provider_metadata("node-pty", |provider| {
+            provider
+                .versions
+                .get(&version)
+                .and_then(|version_meta| version_meta.platforms.get(&platform))
+                .is_some_and(|platform_meta| {
+                    if platform_meta.files.is_empty() {
+                        platform_meta.filename == filename
+                    } else {
+                        platform_meta.files.contains_key(&filename)
+                    }
+                })
+        })
+        .await
+        .unwrap_or(false);
 
-    let allowed = if platform_meta.files.is_empty() {
-        platform_meta.filename == filename
-    } else {
-        platform_meta.files.contains_key(&filename)
-    };
     if !allowed {
         return Err(StatusCode::NOT_FOUND);
     }
 
     serve_storage_file(
         state.as_ref(),
+        req,
         "node-pty",
         &["versions", &version, "prebuilds", &platform, &filename],
         "application/octet-stream",
@@ -613,9 +698,11 @@ async fn node_pty_binary(
 async fn node_pty_checksums(
     State(state): State<Arc<AppState>>,
     Path(version): Path<String>,
+    req: Request,
 ) -> Result<Response, StatusCode> {
     serve_storage_file(
         state.as_ref(),
+        req,
         "node-pty",
         &["versions", &version, "checksums.json"],
         "application/json",
@@ -625,171 +712,141 @@ async fn node_pty_checksums(
 }
 
 // Install script for Linux/macOS
-async fn claude_code_install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn claude_code_install_sh(State(state): State<Arc<AppState>>) -> Response {
     let Some(mirror_url) = state.config.server.public_url.clone() else {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("server.public_url is not configured"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "server.public_url is not configured",
+        )
+            .into_response();
     };
 
     let script = generate_install_sh(&mirror_url);
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/x-shellscript")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
 // Install script for Windows
-async fn claude_code_install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn claude_code_install_ps1(State(state): State<Arc<AppState>>) -> Response {
     let Some(mirror_url) = state.config.server.public_url.clone() else {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("server.public_url is not configured"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "server.public_url is not configured",
+        )
+            .into_response();
     };
 
     let script = generate_install_ps1(&mirror_url);
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/plain")], script).into_response()
 }
 
 // Uninstall script for Linux/macOS
-async fn claude_code_uninstall_sh() -> impl IntoResponse {
+async fn claude_code_uninstall_sh() -> Response {
     let script = generate_uninstall_sh();
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/x-shellscript")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
 // Uninstall script for Windows
-async fn claude_code_uninstall_ps1() -> impl IntoResponse {
+async fn claude_code_uninstall_ps1() -> Response {
     let script = generate_uninstall_ps1();
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/plain")], script).into_response()
 }
 
 // Install script for Codex (Linux/macOS)
-async fn codex_install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn codex_install_sh(State(state): State<Arc<AppState>>) -> Response {
     let Some(mirror_url) = state.config.server.public_url.clone() else {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("server.public_url is not configured"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "server.public_url is not configured",
+        )
+            .into_response();
     };
 
     let script = generate_codex_install_sh(&mirror_url);
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/x-shellscript")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
 // Install script for Codex (Windows)
-async fn codex_install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn codex_install_ps1(State(state): State<Arc<AppState>>) -> Response {
     let Some(mirror_url) = state.config.server.public_url.clone() else {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("server.public_url is not configured"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "server.public_url is not configured",
+        )
+            .into_response();
     };
 
     let script = generate_codex_install_ps1(&mirror_url);
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/plain")], script).into_response()
 }
 
 // Uninstall script for Codex (Linux/macOS)
-async fn codex_uninstall_sh() -> impl IntoResponse {
+async fn codex_uninstall_sh() -> Response {
     let script = generate_codex_uninstall_sh();
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/x-shellscript")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
 // Uninstall script for Codex (Windows)
-async fn codex_uninstall_ps1() -> impl IntoResponse {
+async fn codex_uninstall_ps1() -> Response {
     let script = generate_codex_uninstall_ps1();
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/plain")], script).into_response()
 }
 
 // Install script for Gemini (Linux/macOS)
-async fn gemini_install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn gemini_install_sh(State(state): State<Arc<AppState>>) -> Response {
     let Some(mirror_url) = state.config.server.public_url.clone() else {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("server.public_url is not configured"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "server.public_url is not configured",
+        )
+            .into_response();
     };
 
     let script = generate_gemini_install_sh(&mirror_url);
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/x-shellscript")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
 // Install script for Gemini (Windows)
-async fn gemini_install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn gemini_install_ps1(State(state): State<Arc<AppState>>) -> Response {
     let Some(mirror_url) = state.config.server.public_url.clone() else {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("server.public_url is not configured"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "server.public_url is not configured",
+        )
+            .into_response();
     };
 
     let script = generate_gemini_install_ps1(&mirror_url);
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/plain")], script).into_response()
 }
 
 // Uninstall script for Gemini (Linux/macOS)
-async fn gemini_uninstall_sh() -> impl IntoResponse {
+async fn gemini_uninstall_sh() -> Response {
     let script = generate_gemini_uninstall_sh();
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/x-shellscript")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
 }
 
 // Uninstall script for Gemini (Windows)
-async fn gemini_uninstall_ps1() -> impl IntoResponse {
+async fn gemini_uninstall_ps1() -> Response {
     let script = generate_gemini_uninstall_ps1();
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(script))
-        .unwrap()
+    ([(header::CONTENT_TYPE, "text/plain")], script).into_response()
 }
 
 // API: Get info
@@ -804,14 +861,21 @@ async fn api_claude_code_versions(State(state): State<Arc<AppState>>) -> Json<Ve
 
 // API: Get checksums for all versions and platforms
 async fn api_claude_code_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let metadata = state.cache.get_metadata().await;
-    Json(provider_checksums_json(&metadata.claude_code))
+    let checksums = state
+        .cache
+        .with_provider_metadata("claude-code", provider_checksums_json)
+        .await
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    Json(checksums)
 }
 
 // API: Refresh cache
 async fn api_claude_code_refresh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_refresh_auth(state.as_ref(), &headers)?;
+    check_refresh_throttle(state.as_ref(), "claude-code").await?;
     match sync_claude_locked(state.as_ref()).await {
         Ok(updated) => Ok(Json(serde_json::json!({
             "success": true,
@@ -836,14 +900,21 @@ async fn api_codex_versions(State(state): State<Arc<AppState>>) -> Json<Vec<Stri
 
 // API: Codex checksums
 async fn api_codex_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let metadata = state.cache.get_metadata().await;
-    Json(provider_checksums_json(&metadata.codex))
+    let checksums = state
+        .cache
+        .with_provider_metadata("codex", provider_checksums_json)
+        .await
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    Json(checksums)
 }
 
 // API: Refresh Codex cache
 async fn api_codex_refresh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_refresh_auth(state.as_ref(), &headers)?;
+    check_refresh_throttle(state.as_ref(), "codex").await?;
     match sync_codex_locked(state.as_ref()).await {
         Ok(updated) => Ok(Json(serde_json::json!({
             "success": true,
@@ -868,14 +939,21 @@ async fn api_gemini_versions(State(state): State<Arc<AppState>>) -> Json<Vec<Str
 
 // API: Gemini checksums
 async fn api_gemini_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let metadata = state.cache.get_metadata().await;
-    Json(provider_checksums_json(&metadata.gemini))
+    let checksums = state
+        .cache
+        .with_provider_metadata("gemini", provider_checksums_json)
+        .await
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    Json(checksums)
 }
 
 // API: Refresh Gemini cache
 async fn api_gemini_refresh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_refresh_auth(state.as_ref(), &headers)?;
+    check_refresh_throttle(state.as_ref(), "gemini").await?;
     match sync_gemini_locked(state.as_ref()).await {
         Ok(updated) => Ok(Json(serde_json::json!({
             "success": true,
@@ -900,14 +978,21 @@ async fn api_installer_versions(State(state): State<Arc<AppState>>) -> Json<Vec<
 
 // API: Installer checksums
 async fn api_installer_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let metadata = state.cache.get_metadata().await;
-    Json(provider_checksums_json(&metadata.installer))
+    let checksums = state
+        .cache
+        .with_provider_metadata("installer", provider_checksums_json)
+        .await
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    Json(checksums)
 }
 
 // API: Refresh installer cache
 async fn api_installer_refresh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_refresh_auth(state.as_ref(), &headers)?;
+    check_refresh_throttle(state.as_ref(), "installer").await?;
     match sync_installer_locked(state.as_ref()).await {
         Ok(updated) => Ok(Json(serde_json::json!({
             "success": true,
@@ -932,14 +1017,21 @@ async fn api_node_versions(State(state): State<Arc<AppState>>) -> Json<Vec<Strin
 
 // API: Node checksums
 async fn api_node_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let metadata = state.cache.get_metadata().await;
-    Json(provider_checksums_json(&metadata.node))
+    let checksums = state
+        .cache
+        .with_provider_metadata("node", provider_checksums_json)
+        .await
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    Json(checksums)
 }
 
 // API: Refresh Node cache
 async fn api_node_refresh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_refresh_auth(state.as_ref(), &headers)?;
+    check_refresh_throttle(state.as_ref(), "node").await?;
     match sync_node_locked(state.as_ref()).await {
         Ok(updated) => Ok(Json(serde_json::json!({
             "success": true,
@@ -964,14 +1056,21 @@ async fn api_node_pty_versions(State(state): State<Arc<AppState>>) -> Json<Vec<S
 
 // API: node-pty checksums
 async fn api_node_pty_checksums(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let metadata = state.cache.get_metadata().await;
-    Json(provider_checksums_json(&metadata.node_pty))
+    let checksums = state
+        .cache
+        .with_provider_metadata("node-pty", provider_checksums_json)
+        .await
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    Json(checksums)
 }
 
 // API: Refresh node-pty cache
 async fn api_node_pty_refresh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_refresh_auth(state.as_ref(), &headers)?;
+    check_refresh_throttle(state.as_ref(), "node-pty").await?;
     match sync_node_pty_locked(state.as_ref()).await {
         Ok(updated) => Ok(Json(serde_json::json!({
             "success": true,
@@ -984,56 +1083,129 @@ async fn api_node_pty_refresh(
     }
 }
 
+fn truncate_for_metadata(mut value: String, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value;
+    }
+    value.truncate(max_len);
+    value.push_str("...");
+    value
+}
+
+fn summarize_sync_error(err: &anyhow::Error) -> String {
+    // Keep it compact for JSON responses.
+    let summary = format!("{:#}", err)
+        .replace(['\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_for_metadata(summary, 500)
+}
+
+async fn sync_provider_with_status<T, Fut, F>(
+    state: &AppState,
+    provider: &'static str,
+    f: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let started_at = Utc::now();
+    state
+        .cache
+        .update_provider_metadata(provider, |meta| {
+            meta.sync.last_started_at = Some(started_at);
+        })
+        .await?;
+
+    let started = Instant::now();
+    let result = f().await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let finished_at = Utc::now();
+
+    match &result {
+        Ok(_) => {
+            state
+                .cache
+                .update_provider_metadata(provider, |meta| {
+                    meta.sync.last_success_at = Some(finished_at);
+                    meta.sync.last_duration_ms = Some(duration_ms);
+                    meta.sync.last_error = None;
+                })
+                .await?;
+        }
+        Err(err) => {
+            let summary = summarize_sync_error(err);
+            state
+                .cache
+                .update_provider_metadata(provider, |meta| {
+                    meta.sync.last_failure_at = Some(finished_at);
+                    meta.sync.last_duration_ms = Some(duration_ms);
+                    meta.sync.last_error = Some(summary);
+                })
+                .await?;
+        }
+    }
+
+    result
+}
+
 async fn sync_claude_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
-    state.claude_code.sync_all().await
+    sync_provider_with_status(state, "claude-code", || state.claude_code.sync_all()).await
 }
 
 async fn sync_codex_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
-    state.codex.sync_all().await
+    sync_provider_with_status(state, "codex", || state.codex.sync_all()).await
 }
 
 async fn sync_gemini_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
-    state.gemini.sync_all().await
+    sync_provider_with_status(state, "gemini", || state.gemini.sync_all()).await
 }
 
 async fn sync_installer_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
-    state.installer.sync_all().await
+    sync_provider_with_status(state, "installer", || state.installer.sync_all()).await
 }
 
 async fn sync_node_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
-    state.node.sync_all().await
+    sync_provider_with_status(state, "node", || state.node.sync_all()).await
 }
 
 async fn sync_node_pty_locked(state: &AppState) -> Result<Vec<String>> {
     let _guard = state.sync_lock.lock().await;
-    state.node_pty.sync_all().await
+    sync_provider_with_status(state, "node-pty", || state.node_pty.sync_all()).await
 }
 
 async fn sync_all_locked(state: &AppState) -> Result<()> {
     let _guard = state.sync_lock.lock().await;
     let mut errors = Vec::new();
 
-    if let Err(e) = state.claude_code.sync_all().await {
+    if let Err(e) =
+        sync_provider_with_status(state, "claude-code", || state.claude_code.sync_all()).await
+    {
         errors.push(format!("claude-code: {}", e));
     }
-    if let Err(e) = state.codex.sync_all().await {
+    if let Err(e) = sync_provider_with_status(state, "codex", || state.codex.sync_all()).await {
         errors.push(format!("codex: {}", e));
     }
-    if let Err(e) = state.gemini.sync_all().await {
+    if let Err(e) = sync_provider_with_status(state, "gemini", || state.gemini.sync_all()).await {
         errors.push(format!("gemini: {}", e));
     }
-    if let Err(e) = state.installer.sync_all().await {
+    if let Err(e) =
+        sync_provider_with_status(state, "installer", || state.installer.sync_all()).await
+    {
         errors.push(format!("installer: {}", e));
     }
-    if let Err(e) = state.node.sync_all().await {
+    if let Err(e) = sync_provider_with_status(state, "node", || state.node.sync_all()).await {
         errors.push(format!("node: {}", e));
     }
-    if let Err(e) = state.node_pty.sync_all().await {
+    if let Err(e) = sync_provider_with_status(state, "node-pty", || state.node_pty.sync_all()).await
+    {
         errors.push(format!("node-pty: {}", e));
     }
 
@@ -1076,6 +1248,79 @@ fn provider_checksums_json(provider: &ProviderMetadata) -> serde_json::Value {
     }
 
     serde_json::Value::Object(checksums)
+}
+
+fn require_refresh_auth(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let Some(expected) = state.config.server.refresh_token.as_deref() else {
+        warn!("Refresh endpoint called but server.refresh_token is not configured");
+        return Err(StatusCode::FORBIDDEN);
+    };
+
+    let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    if token == expected {
+        Ok(())
+    } else {
+        warn!("Unauthorized refresh attempt");
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn check_refresh_throttle(
+    state: &AppState,
+    provider: &'static str,
+) -> Result<(), StatusCode> {
+    let min_secs = state.config.server.refresh_min_interval_seconds;
+    if min_secs == 0 {
+        return Ok(());
+    }
+
+    let interval = Duration::from_secs(min_secs);
+    let now = Instant::now();
+    let mut guard = state.refresh_throttle.lock().await;
+
+    if let Some(last) = guard.get(provider) {
+        if now.duration_since(*last) < interval {
+            warn!("Refresh throttled for provider {}", provider);
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    guard.insert(provider, now);
+    Ok(())
+}
+
+fn sanitize_filename_for_header(filename: &str) -> String {
+    // Keep it conservative to avoid header injection/panic:
+    // allow [A-Za-z0-9._-], replace others with '_'.
+    let mut out = String::with_capacity(filename.len());
+    for ch in filename.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "download".to_string()
+    } else {
+        out
+    }
+}
+
+fn content_disposition_header_value(filename: &str) -> Result<HeaderValue, StatusCode> {
+    let safe = sanitize_filename_for_header(filename);
+    let value = format!("attachment; filename=\"{}\"", safe);
+    HeaderValue::from_str(&value).map_err(|err| {
+        error!("Failed to build Content-Disposition header: {}", err);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn inject_mirror_url_sh(script: &str, mirror_url: &str) -> String {
