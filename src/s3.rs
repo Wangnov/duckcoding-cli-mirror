@@ -22,7 +22,8 @@ use crate::config::S3Config;
 use crate::progress::{format_bytes, format_rate, progress_log_interval};
 
 const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
-const PART_SIZE: usize = 5 * 1024 * 1024;
+const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+const MAX_S3_PARTS: usize = 10_000;
 
 pub struct UploadResult {
     pub size: u64,
@@ -367,10 +368,16 @@ pub async fn upload_file_with_client(
         return Ok(());
     }
 
+    let max_parts = multipart_max_parts(config);
+    let part_size = multipart_part_size(total_size, max_parts);
+    let part_attempts = multipart_part_max_attempts(config);
     info!(
-        "Starting multipart upload to S3 object {} (size: {})",
+        "Starting multipart upload to S3 object {} (size: {}, part_size: {}, max_parts: {}, part_attempts: {})",
         object_key,
-        format_bytes(total_size)
+        format_bytes(total_size),
+        format_bytes(part_size as u64),
+        max_parts,
+        part_attempts
     );
 
     let mut create_request = client
@@ -394,7 +401,7 @@ pub async fn upload_file_with_client(
     let mut file = tokio::fs::File::open(path)
         .await
         .context("Failed to open upload file")?;
-    let mut buffer = vec![0u8; PART_SIZE];
+    let mut buffer = vec![0u8; part_size];
     let mut part_number: i32 = 1;
     let mut completed_parts: Vec<UploadPartInfo> = Vec::new();
     let mut uploaded: u64 = 0;
@@ -403,7 +410,7 @@ pub async fn upload_file_with_client(
     let upload_result = async {
         loop {
             let mut filled = 0usize;
-            while filled < PART_SIZE {
+            while filled < part_size {
                 let read = file.read(&mut buffer[filled..]).await?;
                 if read == 0 {
                     break;
@@ -416,22 +423,17 @@ pub async fn upload_file_with_client(
             }
 
             let bytes = Bytes::copy_from_slice(&buffer[..filled]);
-            let resp = client
-                .upload_part()
-                .bucket(&config.bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .content_length(filled as i64)
-                .body(ByteStream::from(bytes))
-                .send()
-                .await
-                .with_context(|| format!("Failed to upload part {}", part_number))?;
-
-            let etag = resp
-                .e_tag()
-                .map(|s| s.to_string())
-                .context("Missing ETag from upload_part")?;
+            let etag = upload_part_with_retry(
+                client,
+                &config.bucket,
+                &key,
+                &upload_id,
+                part_number,
+                bytes,
+                part_attempts,
+            )
+            .await
+            .with_context(|| format!("Failed to upload part {}", part_number))?;
             completed_parts.push(UploadPartInfo { part_number, etag });
 
             uploaded += filled as u64;
@@ -515,6 +517,78 @@ pub async fn upload_file_with_client(
     }
 
     Ok(())
+}
+
+fn multipart_max_parts(config: &S3Config) -> usize {
+    let max_parts = config.multipart_max_parts.max(1);
+    max_parts.min(MAX_S3_PARTS)
+}
+
+fn multipart_part_max_attempts(config: &S3Config) -> usize {
+    config.multipart_part_max_attempts.max(1)
+}
+
+fn multipart_part_size(total_size: u64, max_parts: usize) -> usize {
+    let max_parts = max_parts.max(1) as u64;
+    let mut part_size = (total_size + max_parts - 1) / max_parts;
+    if part_size < MIN_PART_SIZE {
+        part_size = MIN_PART_SIZE;
+    }
+    part_size as usize
+}
+
+fn multipart_retry_delay(attempt: usize) -> Duration {
+    let attempt = attempt.max(1).min(6) as u32;
+    let delay_ms = 500u64.saturating_mul(1u64 << (attempt - 1));
+    Duration::from_millis(delay_ms.min(5_000))
+}
+
+async fn upload_part_with_retry(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    bytes: Bytes,
+    max_attempts: usize,
+) -> Result<String> {
+    let max_attempts = max_attempts.max(1);
+    let mut attempt = 0usize;
+
+    loop {
+        attempt += 1;
+        let result = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .content_length(bytes.len() as i64)
+            .body(ByteStream::from(bytes.clone()))
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let etag = resp
+                    .e_tag()
+                    .map(|s| s.to_string())
+                    .context("Missing ETag from upload_part")?;
+                return Ok(etag);
+            }
+            Err(err) => {
+                if attempt >= max_attempts {
+                    return Err(err.into());
+                }
+                let delay = multipart_retry_delay(attempt);
+                warn!(
+                    "Upload part {} failed (attempt {}/{}), retrying in {:?}: {:#}",
+                    part_number, attempt, max_attempts, delay, err
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 async fn complete_multipart_upload_with_policy(

@@ -261,6 +261,12 @@ pub struct S3Config {
 
     #[serde(default = "default_s3_expires_seconds")]
     pub expires_seconds: u64,
+
+    #[serde(default = "default_s3_multipart_max_parts")]
+    pub multipart_max_parts: usize,
+
+    #[serde(default = "default_s3_multipart_part_max_attempts")]
+    pub multipart_part_max_attempts: usize,
 }
 
 impl Default for S3Config {
@@ -275,6 +281,8 @@ impl Default for S3Config {
             prefix: default_s3_prefix(),
             path_style: default_s3_path_style(),
             expires_seconds: default_s3_expires_seconds(),
+            multipart_max_parts: default_s3_multipart_max_parts(),
+            multipart_part_max_attempts: default_s3_multipart_part_max_attempts(),
         }
     }
 }
@@ -319,6 +327,22 @@ fn default_s3_expires_seconds() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(900)
+}
+
+fn default_s3_multipart_max_parts() -> usize {
+    std::env::var("MIRROR_S3_MULTIPART_MAX_PARTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(10_000)
+}
+
+fn default_s3_multipart_part_max_attempts() -> usize {
+    std::env::var("MIRROR_S3_MULTIPART_PART_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(3)
 }
 
 impl Default for ServerConfig {

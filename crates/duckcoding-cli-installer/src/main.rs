@@ -6,6 +6,7 @@ use reqwest::Proxy;
 use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -412,6 +413,13 @@ fn install_claude(ctx: &InstallContext, args: ProviderArgs) -> Result<()> {
     update_bin_link(&ctx.bin_dir, binary_name, &version_bin, is_windows)?;
     setup_path(&ctx.bin_dir, binary_name, args.no_modify_path, &ui)?;
     update_versions(&mut versions, "claude", &version, &tag, &ctx.install_dir)?;
+    if let Err(err) = write_claude_config() {
+        ui.warn(&format!("{}: {err:#}", tr("claude_config_failed")));
+    }
+    if let Err(err) = prune_old_versions(&ctx.install_dir.join("claude").join("versions"), &version)
+    {
+        ui.warn(&format!("{}: {err:#}", tr("cleanup_old_versions_failed")));
+    }
     let command_path = ctx.bin_dir.join(binary_name);
     ui.success(&format!(
         "{} {}",
@@ -578,9 +586,10 @@ fn install_node(
     fs::create_dir_all(&extract_dir)?;
     extract_archive(&archive_path, &extract_dir)?;
 
+    let node_dir_prefix = node_archive_dir_prefix(node_version);
     let node_root = find_first_dir(&extract_dir, |path| {
         if let Some(name) = path.file_name().and_then(OsStr::to_str) {
-            name.starts_with(&format!("node-v{node_version}-"))
+            name.starts_with(&node_dir_prefix)
         } else {
             false
         }
@@ -987,6 +996,33 @@ fn write_file_atomic(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn write_file_atomic_with_permissions(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| anyhow!("path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(content)?;
+    tmp.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if path.exists() {
+            fs::metadata(path)?.permissions().mode()
+        } else {
+            0o600
+        };
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
+    }
+    fs::rename(tmp.path(), path).or_else(|_| {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(tmp.path(), path)
+    })?;
+    fsync_path(path)?;
+    fsync_path(parent)?;
+    Ok(())
+}
+
 fn fsync_path(path: &Path) -> Result<()> {
     if let Ok(file) = File::open(path) {
         let _ = file.sync_all();
@@ -1267,6 +1303,181 @@ fn normalize_node_platform(platform: &str) -> (String, bool) {
     }
 }
 
+fn node_archive_dir_prefix(node_version: &str) -> String {
+    let mut version = node_version;
+    if let Some(stripped) = version.strip_prefix("node-v") {
+        version = stripped;
+    } else if let Some(stripped) = version.strip_prefix("node-") {
+        version = stripped;
+    }
+    if let Some(stripped) = version.strip_prefix('v') {
+        version = stripped;
+    }
+    format!("node-v{version}-")
+}
+
+fn write_claude_config() -> Result<()> {
+    let path = claude_config_path()?;
+    let existing = load_json_if_exists(&path)?;
+    let mut root = normalize_json_object(existing);
+
+    let user_id = root
+        .get("userID")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(generate_user_id);
+    let first_start = root
+        .get("firstStartTime")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(utc_now_rfc3339_millis);
+
+    root.insert(
+        "installMethod".to_string(),
+        Value::String("native".to_string()),
+    );
+    root.insert("autoUpdates".to_string(), Value::Bool(false));
+    root.insert(
+        "autoUpdatesProtectedForNative".to_string(),
+        Value::Bool(true),
+    );
+    root.insert("userID".to_string(), Value::String(user_id));
+    root.insert("firstStartTime".to_string(), Value::String(first_start));
+    root.insert("sonnet45MigrationComplete".to_string(), Value::Bool(true));
+    root.insert("opus45MigrationComplete".to_string(), Value::Bool(true));
+    root.insert("opusProMigrationComplete".to_string(), Value::Bool(true));
+    root.insert("thinkingMigrationComplete".to_string(), Value::Bool(true));
+
+    if let Some(Value::Object(features)) = root.get_mut("cachedGrowthBookFeatures") {
+        let defaults = default_growthbook_features();
+        for (key, value) in defaults {
+            features.entry(key).or_insert(value);
+        }
+    } else {
+        root.insert(
+            "cachedGrowthBookFeatures".to_string(),
+            Value::Object(default_growthbook_features()),
+        );
+    }
+
+    let json = serde_json::to_vec_pretty(&Value::Object(root))?;
+    write_file_atomic_with_permissions(&path, &json)
+}
+
+fn prune_old_versions(versions_dir: &Path, keep_version: &str) -> Result<()> {
+    if !versions_dir.exists() {
+        return Ok(());
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for entry in fs::read_dir(versions_dir)? {
+        let entry = match entry {
+            Ok(item) => item,
+            Err(err) => {
+                last_err = Some(err.into());
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(value) => value,
+            Err(err) => {
+                last_err = Some(err.into());
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == keep_version {
+            continue;
+        }
+        let trash_name = format!("{}.old.{}", name, unix_timestamp());
+        let trash_path = versions_dir.join(trash_name);
+        let remove_result = match fs::rename(&path, &trash_path) {
+            Ok(()) => fs::remove_dir_all(&trash_path),
+            Err(_) => fs::remove_dir_all(&path),
+        };
+        if let Err(err) = remove_result {
+            last_err = Some(err.into());
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn load_json_if_exists(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read_to_string(path)?;
+    let json = serde_json::from_str::<Value>(&data)?;
+    Ok(Some(json))
+}
+
+fn normalize_json_object(value: Option<Value>) -> Map<String, Value> {
+    match value {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    }
+}
+
+fn default_growthbook_features() -> Map<String, Value> {
+    let mut map = Map::new();
+    let mut batch = Map::new();
+    batch.insert(
+        "scheduledDelayMillis".to_string(),
+        Value::Number(5000.into()),
+    );
+    batch.insert("maxExportBatchSize".to_string(), Value::Number(200.into()));
+    batch.insert("maxQueueSize".to_string(), Value::Number(8192.into()));
+    map.insert(
+        "tengu_1p_event_batch_config".to_string(),
+        Value::Object(batch),
+    );
+    map.insert("tengu_mcp_tool_search".to_string(), Value::Bool(false));
+    map.insert("tengu_scratch".to_string(), Value::Bool(false));
+    map.insert("tengu_log_segment_events".to_string(), Value::Bool(false));
+    map.insert("tengu_log_datadog_events".to_string(), Value::Bool(true));
+    map.insert(
+        "tengu_pid_based_version_locking".to_string(),
+        Value::Bool(true),
+    );
+    map.insert(
+        "tengu_event_sampling_config".to_string(),
+        Value::Object(Map::new()),
+    );
+    map.insert("tengu_tool_pear".to_string(), Value::Bool(false));
+    map.insert(
+        "tengu_keybinding_customization".to_string(),
+        Value::Bool(false),
+    );
+    map.insert("tengu_thinkback".to_string(), Value::Bool(false));
+    map
+}
+
+fn generate_user_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let user = std::env::var("USER").unwrap_or_default();
+    let seed = format!("{now}-{pid}-{user}");
+    hex::encode(Sha256::digest(seed.as_bytes()))
+}
+
+fn claude_config_path() -> Result<PathBuf> {
+    let home = if cfg!(windows) {
+        std::env::var("USERPROFILE").context("USERPROFILE is not set")?
+    } else {
+        std::env::var("HOME").context("HOME is not set")?
+    };
+    Ok(PathBuf::from(home).join(".claude.json"))
+}
+
 fn provider_version_dir(install_dir: &Path, provider: &str, version: &str) -> PathBuf {
     install_dir.join(provider).join("versions").join(version)
 }
@@ -1432,6 +1643,18 @@ fn utc_now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn utc_now_rfc3339_millis() -> String {
+    let format = time::format_description::parse(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+    );
+    match format {
+        Ok(fmt) => time::OffsetDateTime::now_utc()
+            .format(&fmt)
+            .unwrap_or_else(|_| utc_now_rfc3339()),
+        Err(_) => utc_now_rfc3339(),
+    }
 }
 
 fn unix_timestamp() -> i64 {

@@ -61,7 +61,7 @@ access_key_id = ""
 secret_access_key = ""
 # 可选：STS 临时凭证
 # session_token = ""
-# R2 通常使用 "auto"
+# R2 通常使用 "auto"，默认固定区域 "us-east-1"
 region = "auto"
 # 可选：对象前缀，例如 "mirror"
 prefix = ""
@@ -69,6 +69,10 @@ prefix = ""
 path_style = true
 # 预签名链接过期时间（秒）
 expires_seconds = 900
+# S3 兼容服务可能限制最大分片数（例如 20）
+multipart_max_parts = 20
+# 单个分片上传最大尝试次数（含首次）
+multipart_part_max_attempts = 5
 
 # Auto-update settings
 [update]
